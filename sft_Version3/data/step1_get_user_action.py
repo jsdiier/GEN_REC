@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+从 Hive 表 user_action_sample_d_whole_v2 对应的 HDFS parquet 路径，
+在 [train_start, train_end] 窗口内按 dt 逐天流式读取用户行为样本。
+
+设计要点：
+  - 不落盘：用 `hadoop fs -cat <part>` 把单个 part 文件的字节流读进内存 BytesIO，
+            再交给 pyarrow 解析（parquet footer 在文件尾，无法逐行网络流式，
+            这是「内存里流式出行 + 按 part 早停」的最佳折中）。
+  - 早停：  max_num > 0 时凑够 max_num 行立即停止，后续 part / dt 分区不再触碰。
+  - 本步只做「取数 + 打印原始数据」，不写任何输出文件；schema 与前几行打出来后，
+    再决定下游样本怎么拼（step3）。
+
+用法:
+    python3 step1_get_user_action.py [common.conf]
+"""
+
+import os
+import sys
+import json
+import subprocess
+import configparser
+from datetime import datetime, timedelta
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    print("[ERROR] 需要 pyarrow，请先 pip install pyarrow", file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------
+# 配置
+# ------------------------------------------------------------------
+def load_config(conf_path: str) -> dict:
+    cp = configparser.ConfigParser()
+    if not cp.read(conf_path, encoding="utf-8"):
+        raise FileNotFoundError(f"找不到配置文件: {conf_path}")
+    return {
+        "hadoop_bin": cp.get("hadoop", "hadoop_bin"),
+        "hdfs_root": cp.get("hive", "hdfs_root"),
+        "table": cp.get("hive", "table"),
+        "country_code": cp.get("hive", "country_code"),
+        "train_start": cp.get("data", "train_start"),
+        "train_end": cp.get("data", "train_end"),
+        "max_num": cp.getint("data", "max_num"),
+        "log_sample_count": cp.getint("data", "log_sample_count", fallback=3),
+    }
+
+
+# ------------------------------------------------------------------
+# HDFS 访问
+# ------------------------------------------------------------------
+def daterange(start: str, end: str):
+    """按天遍历 [start, end]（含端点），dt 格式 YYYYMMDD。"""
+    d0 = datetime.strptime(start, "%Y%m%d")
+    d1 = datetime.strptime(end, "%Y%m%d")
+    if d1 < d0:
+        raise ValueError(f"train_end({end}) 早于 train_start({start})")
+    cur = d0
+    while cur <= d1:
+        yield cur.strftime("%Y%m%d")
+        cur += timedelta(days=1)
+
+
+def build_partition_dir(cfg: dict, dt: str) -> str:
+    return "/".join([
+        cfg["hdfs_root"].rstrip("/"),
+        cfg["table"],
+        f"dt={dt}",
+        f"country_code={cfg['country_code']}",
+    ])
+
+
+def list_part_files(hadoop_bin: str, hdfs_dir: str) -> list:
+    """列出分区下所有 part 文件，按文件名排序保证可复现；分区不存在时返回空。"""
+    ret = subprocess.run([hadoop_bin, "fs", "-ls", hdfs_dir],
+                         capture_output=True, text=True)
+    if ret.returncode != 0:
+        print(f"[WARN] 列目录失败（可能该 dt 分区不存在），跳过: {hdfs_dir}\n"
+              f"       stderr: {ret.stderr.strip()}")
+        return []
+    files = []
+    for line in ret.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        path = parts[-1]
+        if os.path.basename(path).startswith("part-"):
+            files.append(path)
+    files.sort()
+    return files
+
+
+def cat_parquet_to_reader(hadoop_bin: str, hdfs_path: str) -> "pa.BufferReader":
+    """把 HDFS 上的 parquet part 文件 cat 进内存（不落盘），返回可 seek 的 BufferReader。"""
+    ret = subprocess.run([hadoop_bin, "fs", "-cat", hdfs_path],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if ret.returncode != 0:
+        raise RuntimeError(f"hadoop fs -cat 失败 {hdfs_path}: "
+                           f"{ret.stderr.decode('utf-8', 'ignore')}")
+    return pa.BufferReader(ret.stdout)
+
+
+def stream_rows(cfg: dict, batch_size: int = 1024):
+    """
+    生成器：在窗口内逐 dt、逐 part 流式产出 (dt, hdfs_path, schema, row)。
+    max_num 早停由调用方负责计数。
+    """
+    for dt in daterange(cfg["train_start"], cfg["train_end"]):
+        hdfs_dir = build_partition_dir(cfg, dt)
+        part_files = list_part_files(cfg["hadoop_bin"], hdfs_dir)
+        if not part_files:
+            continue
+        print(f"[INFO] dt={dt}: 发现 {len(part_files)} 个 part 文件")
+        for hdfs_path in part_files:
+            reader = cat_parquet_to_reader(cfg["hadoop_bin"], hdfs_path)
+            pf = pq.ParquetFile(reader)
+            for batch in pf.iter_batches(batch_size=batch_size):
+                for row in batch.to_pylist():
+                    yield dt, hdfs_path, pf.schema_arrow, row
+
+
+# ------------------------------------------------------------------
+# 打印
+# ------------------------------------------------------------------
+def print_schema(schema):
+    print("\n================ 原始数据 SCHEMA ================")
+    for field in schema:
+        print(f"  {field.name}: {field.type}")
+    print(f"  （共 {len(schema.names)} 列）")
+    print("================================================\n")
+
+
+def print_row(idx: int, dt: str, hdfs_path: str, row: dict):
+    """整行打成紧凑 JSON（不缩进、不截断、保留非 ASCII），方便整行复制出去细看。"""
+    print(f"---------- 样本 #{idx}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
+    print(json.dumps(row, ensure_ascii=False, default=str))
+    print()
+
+
+# ------------------------------------------------------------------
+# 主流程
+# ------------------------------------------------------------------
+def main():
+    conf_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "common.conf"
+    )
+    cfg = load_config(conf_path)
+
+    unlimited = cfg["max_num"] == -1
+    max_desc = "全量窗口数据" if unlimited else str(cfg["max_num"])
+    print(f"[INFO] 表: {cfg['table']}  country_code={cfg['country_code']}")
+    print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}（按 dt 逐天）")
+    print(f"[INFO] 期望读取: {max_desc} 行")
+
+    schema_printed = False
+    n = 0
+    for dt, hdfs_path, schema, row in stream_rows(cfg):
+        if not schema_printed:
+            print_schema(schema)
+            schema_printed = True
+        if n < cfg["log_sample_count"]:
+            print_row(n + 1, dt, hdfs_path, row)
+
+        n += 1
+        if not unlimited and n >= cfg["max_num"]:
+            break
+        if unlimited and n % 100000 == 0:
+            print(f"[INFO] 已累计读取 {n} 行")
+
+    print(f"[INFO] 实际读取 {n} 行（本步仅取数+打印，未落盘）")
+
+
+if __name__ == "__main__":
+    main()
