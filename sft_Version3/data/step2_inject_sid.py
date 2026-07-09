@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+step2: 把用户行为序列（u_pay_item_seq_100）里每个 item_id 映射成 geo_sid。
+
+  - 复用 step1 的流式取数与序列解析；
+  - 加载本地 item_id -> geo_sid 映射表（common.conf [item_map] item_map_path）；
+  - 打印映射后的样本；
+  - 统计缺失率分布：每条序列中「找不到 geo_sid 的 item 占比」的直方图，
+    以及 item 级总缺失率、空序列数。
+
+不在映射表中、或映射到空 geo_sid 的 item，都记为缺失。
+
+用法:
+    python3 step2_inject_sid.py [common.conf]
+"""
+
+import os
+import sys
+import json
+import math
+import configparser
+from collections import Counter
+
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    print("[ERROR] 需要 pyarrow，请先 pip install pyarrow", file=sys.stderr)
+    sys.exit(1)
+
+from step1_get_user_action import load_config, stream_rows, parse_item_seq, SEQ_FIELD
+
+
+# ------------------------------------------------------------------
+# 映射表
+# ------------------------------------------------------------------
+def get_item_map_path(conf_path: str) -> str:
+    cp = configparser.ConfigParser()
+    if not cp.read(conf_path, encoding="utf-8"):
+        raise FileNotFoundError(f"找不到配置文件: {conf_path}")
+    return cp.get("item_map", "item_map_path")
+
+
+def load_item_sid_map(path: str) -> dict:
+    """加载 item_id -> geo_sid 映射（只读两列，item_id 统一转成 str 作 key）。"""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"映射表不存在: {path}")
+    table = pq.read_table(path, columns=["item_id", "geo_sid"])
+    ids = table.column("item_id").to_pylist()
+    sids = table.column("geo_sid").to_pylist()
+    id2sid = {}
+    for i, s in zip(ids, sids):
+        if i is None:
+            continue
+        id2sid[str(i)] = s
+    return id2sid
+
+
+# ------------------------------------------------------------------
+# 映射单条样本
+# ------------------------------------------------------------------
+def map_sample(row: dict, id2sid: dict) -> dict:
+    """把序列映射成 geo_sid；返回映射结果 + 该样本的缺失统计。"""
+    items = parse_item_seq(row.get(SEQ_FIELD, ""))
+    geo_seq = []
+    mapped_items = []
+    missing = 0
+    for it in items:
+        iid = it.get("item_id")
+        sid = id2sid.get(iid)
+        if not sid:  # 不在表中 或 空 geo_sid，都算缺失
+            missing += 1
+            sid = None
+        geo_seq.append(sid)
+        mapped_items.append({
+            "item_id": iid,
+            "geo_sid": sid,
+            "title": it.get("title"),
+        })
+    n = len(items)
+    return {
+        "uid": row.get("uid"),
+        "n_items": n,
+        "n_missing": missing,
+        "miss_rate": (missing / n) if n else None,
+        "geo_sid_seq": geo_seq,
+        "items": mapped_items,
+    }
+
+
+# ------------------------------------------------------------------
+# 缺失率分布
+# ------------------------------------------------------------------
+BUCKET_LABELS = ["=0% (全命中)"] + [f"({(b-1)*10}%,{b*10}%]" for b in range(1, 11)]
+
+
+def bucket_of(rate: float) -> str:
+    if rate <= 0:
+        return "=0% (全命中)"
+    b = math.ceil(rate * 10)  # 1..10
+    b = min(b, 10)
+    return f"({(b-1)*10}%,{b*10}%]"
+
+
+def print_distribution(bucket_counter: Counter, n_nonempty: int,
+                       n_empty: int, total_items: int, total_missing: int):
+    print("\n================ 缺失率分布 ================")
+    print(f"处理序列数: {n_nonempty + n_empty}  (非空 {n_nonempty}, 空序列 {n_empty})")
+    if total_items:
+        print(f"item 级总缺失率: {total_missing}/{total_items} = "
+              f"{total_missing / total_items * 100:.2f}%")
+    print("\n每条序列缺失率的直方图（分母=非空序列数）:")
+    print(f"  {'缺失率区间':<16} {'序列数':>10} {'占比':>10}")
+    for label in BUCKET_LABELS:
+        cnt = bucket_counter.get(label, 0)
+        ratio = (cnt / n_nonempty * 100) if n_nonempty else 0.0
+        print(f"  {label:<16} {cnt:>10} {ratio:>9.2f}%")
+    print("============================================\n")
+
+
+# ------------------------------------------------------------------
+# 主流程
+# ------------------------------------------------------------------
+def main():
+    conf_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "common.conf"
+    )
+    cfg = load_config(conf_path)
+    item_map_path = get_item_map_path(conf_path)
+
+    print(f"[INFO] 加载映射表: {item_map_path}")
+    id2sid = load_item_sid_map(item_map_path)
+    print(f"[INFO] 映射表条目数: {len(id2sid)}")
+
+    unlimited = cfg["max_num"] == -1
+    max_desc = "全量窗口数据" if unlimited else str(cfg["max_num"])
+    print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行\n")
+
+    bucket_counter = Counter()
+    n_nonempty = 0
+    n_empty = 0
+    total_items = 0
+    total_missing = 0
+    n = 0
+
+    for dt, hdfs_path, _schema, row in stream_rows(cfg):
+        mapped = map_sample(row, id2sid)
+
+        if n < cfg["log_sample_count"]:
+            print(f"---------- 映射样本 #{n + 1}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
+            print(json.dumps(mapped, ensure_ascii=False, indent=2, default=str))
+            print()
+
+        if mapped["n_items"] == 0:
+            n_empty += 1
+        else:
+            n_nonempty += 1
+            total_items += mapped["n_items"]
+            total_missing += mapped["n_missing"]
+            bucket_counter[bucket_of(mapped["miss_rate"])] += 1
+
+        n += 1
+        if not unlimited and n >= cfg["max_num"]:
+            break
+        if unlimited and n % 100000 == 0:
+            print(f"[INFO] 已处理 {n} 行")
+
+    print(f"[INFO] 实际处理 {n} 行")
+    print_distribution(bucket_counter, n_nonempty, n_empty, total_items, total_missing)
+
+
+if __name__ == "__main__":
+    main()
