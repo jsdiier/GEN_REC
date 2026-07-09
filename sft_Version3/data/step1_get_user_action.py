@@ -32,6 +32,44 @@ except ImportError:
 
 
 # ------------------------------------------------------------------
+# 行为序列解析规范
+#   u_pay_item_seq_100: item 间用 ||| 分隔，item 内字段用 @_@ 分隔，共 10 个字段
+# ------------------------------------------------------------------
+SEQ_FIELD = "u_pay_item_seq_100"
+ITEM_SEP = "|||"
+FIELD_SEP = "@_@"
+ITEM_FIELDS = ["item_id", "phone_time", "local_hour", "brand_name",
+               "s_main_category_id", "module", "phone_time_local",
+               "title", "description", "brand"]
+
+
+def parse_item_seq(seq_str):
+    """把 u_pay_item_seq_100 字符串解析成结构化 item 列表。字段数不符时标记 _parts_len。"""
+    if not seq_str:
+        return []
+    items = []
+    for chunk in str(seq_str).split(ITEM_SEP):
+        if not chunk:
+            continue
+        parts = chunk.split(FIELD_SEP)
+        item = {f: (parts[i] if i < len(parts) else None)
+                for i, f in enumerate(ITEM_FIELDS)}
+        if len(parts) != len(ITEM_FIELDS):
+            item["_parts_len"] = len(parts)  # 异常行标记，便于排查
+        items.append(item)
+    return items
+
+
+def parse_sample(row: dict) -> dict:
+    """保留用户画像字段原样，把行为序列字符串替换为结构化列表 items + 条数 n_items。"""
+    parsed = {k: v for k, v in row.items() if k != SEQ_FIELD}
+    items = parse_item_seq(row.get(SEQ_FIELD, ""))
+    parsed["n_items"] = len(items)
+    parsed["items"] = items
+    return parsed
+
+
+# ------------------------------------------------------------------
 # 配置
 # ------------------------------------------------------------------
 def load_config(conf_path: str) -> dict:
@@ -135,9 +173,12 @@ def print_schema(schema):
 
 
 def print_row(idx: int, dt: str, hdfs_path: str, row: dict):
-    """整行打成紧凑 JSON（不缩进、不截断、保留非 ASCII），方便整行复制出去细看。"""
+    """打印原始行（紧凑 JSON）+ 解析后的结构（带缩进 JSON，便于看清 item 序列）。"""
     print(f"---------- 样本 #{idx}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
+    print("[原始]")
     print(json.dumps(row, ensure_ascii=False, default=str))
+    print("[解析]")
+    print(json.dumps(parse_sample(row), ensure_ascii=False, indent=2, default=str))
     print()
 
 
