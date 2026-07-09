@@ -85,6 +85,8 @@ def load_config(conf_path: str) -> dict:
         "train_end": cp.get("data", "train_end"),
         "max_num": cp.getint("data", "max_num"),
         "log_sample_count": cp.getint("data", "log_sample_count", fallback=3),
+        "keep_only_full_match": cp.getboolean("data", "keep_only_full_match",
+                                              fallback=True),
     }
 
 

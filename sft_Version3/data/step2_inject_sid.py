@@ -94,6 +94,11 @@ def map_sample(row: dict, id2sid: dict) -> dict:
 BUCKET_LABELS = ["=0% (全命中)"] + [f"({(b-1)*10}%,{b*10}%]" for b in range(1, 11)]
 
 
+def is_full_match(mapped: dict) -> bool:
+    """样本是否「非空且全命中」：序列非空 且 无缺失。开关打开时只保留这类样本。"""
+    return mapped["n_items"] > 0 and mapped["n_missing"] == 0
+
+
 def bucket_of(rate: float) -> str:
     if rate <= 0:
         return "=0% (全命中)"
@@ -104,7 +109,7 @@ def bucket_of(rate: float) -> str:
 
 def print_distribution(bucket_counter: Counter, n_nonempty: int,
                        n_empty: int, total_items: int, total_missing: int):
-    print("\n================ 缺失率分布 ================")
+    print("\n================ 缺失率分布（诊断，统计全部处理样本）================")
     print(f"处理序列数: {n_nonempty + n_empty}  (非空 {n_nonempty}, 空序列 {n_empty})")
     if total_items:
         print(f"item 级总缺失率: {total_missing}/{total_items} = "
@@ -115,7 +120,22 @@ def print_distribution(bucket_counter: Counter, n_nonempty: int,
         cnt = bucket_counter.get(label, 0)
         ratio = (cnt / n_nonempty * 100) if n_nonempty else 0.0
         print(f"  {label:<16} {cnt:>10} {ratio:>9.2f}%")
-    print("============================================\n")
+    print("====================================================================\n")
+
+
+def print_filter_summary(keep_switch: bool, n_total: int, n_kept: int,
+                         n_drop_empty: int, n_drop_missing: int):
+    print("================ 过滤汇总（keep_only_full_match={}）================"
+          .format("on" if keep_switch else "off"))
+    pct = lambda x: (x / n_total * 100) if n_total else 0.0
+    print(f"处理样本总数: {n_total}")
+    print(f"  保留(非空且全命中): {n_kept}  ({pct(n_kept):.2f}%)")
+    print(f"  丢弃合计:          {n_total - n_kept}  ({pct(n_total - n_kept):.2f}%)")
+    print(f"    - 空序列:        {n_drop_empty}  ({pct(n_drop_empty):.2f}%)")
+    print(f"    - 含缺失:        {n_drop_missing}  ({pct(n_drop_missing):.2f}%)")
+    if not keep_switch:
+        print("  （开关关闭：以上仅为统计，未实际过滤）")
+    print("====================================================================\n")
 
 
 # ------------------------------------------------------------------
@@ -132,9 +152,11 @@ def main():
     id2sid = load_item_sid_map(item_map_path)
     print(f"[INFO] 映射表条目数: {len(id2sid)}")
 
+    keep_switch = cfg["keep_only_full_match"]
     unlimited = cfg["max_num"] == -1
     max_desc = "全量窗口数据" if unlimited else str(cfg["max_num"])
-    print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行\n")
+    print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行")
+    print(f"[INFO] keep_only_full_match = {'on' if keep_switch else 'off'}\n")
 
     bucket_counter = Counter()
     n_nonempty = 0
@@ -142,15 +164,16 @@ def main():
     total_items = 0
     total_missing = 0
     n = 0
+    n_kept = 0
+    n_drop_empty = 0
+    n_drop_missing = 0
+    printed = 0
 
     for dt, hdfs_path, _schema, row in stream_rows(cfg):
         mapped = map_sample(row, id2sid)
+        keep = is_full_match(mapped)
 
-        if n < cfg["log_sample_count"]:
-            print(f"---------- 映射样本 #{n + 1}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
-            print(json.dumps(mapped, ensure_ascii=False, indent=2, default=str))
-            print()
-
+        # 诊断统计：始终基于全部处理样本
         if mapped["n_items"] == 0:
             n_empty += 1
         else:
@@ -158,6 +181,22 @@ def main():
             total_items += mapped["n_items"]
             total_missing += mapped["n_missing"]
             bucket_counter[bucket_of(mapped["miss_rate"])] += 1
+
+        # 过滤计数
+        if keep:
+            n_kept += 1
+        elif mapped["n_items"] == 0:
+            n_drop_empty += 1
+        else:
+            n_drop_missing += 1
+
+        # 打印：开关打开时只打印「保留」的样本，关闭时打印全部
+        if printed < cfg["log_sample_count"] and (keep or not keep_switch):
+            tag = "保留样本" if keep_switch else "映射样本"
+            print(f"---------- {tag} #{printed + 1}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
+            print(json.dumps(mapped, ensure_ascii=False, indent=2, default=str))
+            print()
+            printed += 1
 
         n += 1
         if not unlimited and n >= cfg["max_num"]:
@@ -167,6 +206,7 @@ def main():
 
     print(f"[INFO] 实际处理 {n} 行")
     print_distribution(bucket_counter, n_nonempty, n_empty, total_items, total_missing)
+    print_filter_summary(keep_switch, n, n_kept, n_drop_empty, n_drop_missing)
 
 
 if __name__ == "__main__":
