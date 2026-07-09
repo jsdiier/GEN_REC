@@ -33,9 +33,10 @@ except ImportError:
 
 # ------------------------------------------------------------------
 # 行为序列解析规范
-#   u_pay_item_seq_100: item 间用 ||| 分隔，item 内字段用 @_@ 分隔，共 10 个字段
+#   序列字段（如 u_pay_item_seq_100 / u_clk_item_seq_100）共用同一套规范：
+#   item 间用 ||| 分隔，item 内字段用 @_@ 分隔，共 10 个字段。
+#   具体使用哪些序列字段由 common.conf [data] seq_fields 配置。
 # ------------------------------------------------------------------
-SEQ_FIELD = "u_pay_item_seq_100"
 ITEM_SEP = "|||"
 FIELD_SEP = "@_@"
 ITEM_FIELDS = ["item_id", "phone_time", "local_hour", "brand_name",
@@ -44,7 +45,7 @@ ITEM_FIELDS = ["item_id", "phone_time", "local_hour", "brand_name",
 
 
 def parse_item_seq(seq_str):
-    """把 u_pay_item_seq_100 字符串解析成结构化 item 列表。字段数不符时标记 _parts_len。"""
+    """把序列字符串解析成结构化 item 列表。字段数不符时标记 _parts_len。"""
     if not seq_str:
         return []
     items = []
@@ -60,12 +61,12 @@ def parse_item_seq(seq_str):
     return items
 
 
-def parse_sample(row: dict) -> dict:
-    """保留用户画像字段原样，把行为序列字符串替换为结构化列表 items + 条数 n_items。"""
-    parsed = {k: v for k, v in row.items() if k != SEQ_FIELD}
-    items = parse_item_seq(row.get(SEQ_FIELD, ""))
-    parsed["n_items"] = len(items)
-    parsed["items"] = items
+def parse_sample(row: dict, seq_fields: list) -> dict:
+    """保留用户画像字段原样，把每个选中的序列字段替换为 {n_items, items} 结构。"""
+    parsed = {k: v for k, v in row.items() if k not in seq_fields}
+    for f in seq_fields:
+        items = parse_item_seq(row.get(f, ""))
+        parsed[f] = {"n_items": len(items), "items": items}
     return parsed
 
 
@@ -87,6 +88,10 @@ def load_config(conf_path: str) -> dict:
         "log_sample_count": cp.getint("data", "log_sample_count", fallback=3),
         "keep_only_full_match": cp.getboolean("data", "keep_only_full_match",
                                               fallback=True),
+        "seq_fields": [s.strip() for s in
+                       cp.get("data", "seq_fields",
+                              fallback="u_pay_item_seq_100").split(",")
+                       if s.strip()],
     }
 
 
@@ -174,13 +179,13 @@ def print_schema(schema):
     print("================================================\n")
 
 
-def print_row(idx: int, dt: str, hdfs_path: str, row: dict):
+def print_row(idx: int, dt: str, hdfs_path: str, row: dict, seq_fields: list):
     """打印原始行（紧凑 JSON）+ 解析后的结构（带缩进 JSON，便于看清 item 序列）。"""
     print(f"---------- 样本 #{idx}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
     print("[原始]")
     print(json.dumps(row, ensure_ascii=False, default=str))
     print("[解析]")
-    print(json.dumps(parse_sample(row), ensure_ascii=False, indent=2, default=str))
+    print(json.dumps(parse_sample(row, seq_fields), ensure_ascii=False, indent=2, default=str))
     print()
 
 
@@ -197,6 +202,7 @@ def main():
     max_desc = "全量窗口数据" if unlimited else str(cfg["max_num"])
     print(f"[INFO] 表: {cfg['table']}  country_code={cfg['country_code']}")
     print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}（按 dt 逐天）")
+    print(f"[INFO] 序列字段: {cfg['seq_fields']}")
     print(f"[INFO] 期望读取: {max_desc} 行")
 
     schema_printed = False
@@ -206,7 +212,7 @@ def main():
             print_schema(schema)
             schema_printed = True
         if n < cfg["log_sample_count"]:
-            print_row(n + 1, dt, hdfs_path, row)
+            print_row(n + 1, dt, hdfs_path, row, cfg["seq_fields"])
 
         n += 1
         if not unlimited and n >= cfg["max_num"]:

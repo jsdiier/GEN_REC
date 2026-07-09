@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-step2: 把用户行为序列（u_pay_item_seq_100）里每个 item_id 映射成 geo_sid。
+step2: 把用户行为序列（seq_fields，如 u_pay_item_seq_100 / u_clk_item_seq_100）
+里每个 item_id 映射成 geo_sid。多字段「各自独立」处理。
 
   - 复用 step1 的流式取数与序列解析；
   - 加载本地 item_id -> geo_sid 映射表（common.conf [item_map] item_map_path）；
-  - 打印映射后的样本；
-  - 统计缺失率分布：每条序列中「找不到 geo_sid 的 item 占比」的直方图，
-    以及 item 级总缺失率、空序列数。
+  - 每个选中序列字段各自映射、各自出一份缺失率分布；
+  - keep_only_full_match 打开时按「非空字段零缺失即可」保留样本：
+      至少一个选中字段非空，且所有非空字段零缺失 → 保留；
+      全空 或 任一非空字段有缺失 → 丢弃。
+  - 本步只做映射 + 打印 + 统计，不落盘。
 
 不在映射表中、或映射到空 geo_sid 的 item，都记为缺失。
 
@@ -28,7 +31,7 @@ except ImportError:
     print("[ERROR] 需要 pyarrow，请先 pip install pyarrow", file=sys.stderr)
     sys.exit(1)
 
-from step1_get_user_action import load_config, stream_rows, parse_item_seq, SEQ_FIELD
+from step1_get_user_action import load_config, stream_rows, parse_item_seq
 
 
 # ------------------------------------------------------------------
@@ -57,11 +60,11 @@ def load_item_sid_map(path: str) -> dict:
 
 
 # ------------------------------------------------------------------
-# 映射单条样本
+# 映射单条样本（多字段，各自独立）
 # ------------------------------------------------------------------
-def map_sample(row: dict, id2sid: dict) -> dict:
-    """把序列映射成 geo_sid；返回映射结果 + 该样本的缺失统计。"""
-    items = parse_item_seq(row.get(SEQ_FIELD, ""))
+def map_field(seq_str: str, id2sid: dict) -> dict:
+    """映射单个序列字段，返回该字段的 geo_sid 序列与缺失统计。"""
+    items = parse_item_seq(seq_str)
     geo_seq = []
     mapped_items = []
     missing = 0
@@ -72,14 +75,9 @@ def map_sample(row: dict, id2sid: dict) -> dict:
             missing += 1
             sid = None
         geo_seq.append(sid)
-        mapped_items.append({
-            "item_id": iid,
-            "geo_sid": sid,
-            "title": it.get("title"),
-        })
+        mapped_items.append({"item_id": iid, "geo_sid": sid, "title": it.get("title")})
     n = len(items)
     return {
-        "uid": row.get("uid"),
         "n_items": n,
         "n_missing": missing,
         "miss_rate": (missing / n) if n else None,
@@ -88,51 +86,78 @@ def map_sample(row: dict, id2sid: dict) -> dict:
     }
 
 
+def map_sample(row: dict, id2sid: dict, seq_fields: list) -> dict:
+    """对每个选中序列字段各自映射，结果挂在 fields[field] 下。"""
+    return {
+        "uid": row.get("uid"),
+        "fields": {f: map_field(row.get(f, ""), id2sid) for f in seq_fields},
+    }
+
+
+def is_full_match(mapped: dict, seq_fields: list) -> bool:
+    """非空字段零缺失即可：至少一个字段非空，且所有非空字段零缺失。"""
+    fields_with_items = [f for f in seq_fields if mapped["fields"][f]["n_items"] > 0]
+    if not fields_with_items:
+        return False  # 全空
+    return all(mapped["fields"][f]["n_missing"] == 0 for f in fields_with_items)
+
+
 # ------------------------------------------------------------------
-# 缺失率分布
+# 缺失率分布（每个字段各一份）
 # ------------------------------------------------------------------
 BUCKET_LABELS = ["=0% (全命中)"] + [f"({(b-1)*10}%,{b*10}%]" for b in range(1, 11)]
-
-
-def is_full_match(mapped: dict) -> bool:
-    """样本是否「非空且全命中」：序列非空 且 无缺失。开关打开时只保留这类样本。"""
-    return mapped["n_items"] > 0 and mapped["n_missing"] == 0
 
 
 def bucket_of(rate: float) -> str:
     if rate <= 0:
         return "=0% (全命中)"
-    b = math.ceil(rate * 10)  # 1..10
-    b = min(b, 10)
+    b = min(math.ceil(rate * 10), 10)  # 1..10
     return f"({(b-1)*10}%,{b*10}%]"
 
 
-def print_distribution(bucket_counter: Counter, n_nonempty: int,
-                       n_empty: int, total_items: int, total_missing: int):
-    print("\n================ 缺失率分布（诊断，统计全部处理样本）================")
-    print(f"处理序列数: {n_nonempty + n_empty}  (非空 {n_nonempty}, 空序列 {n_empty})")
-    if total_items:
-        print(f"item 级总缺失率: {total_missing}/{total_items} = "
-              f"{total_missing / total_items * 100:.2f}%")
-    print("\n每条序列缺失率的直方图（分母=非空序列数）:")
+def new_field_stat() -> dict:
+    return {"bucket": Counter(), "n_nonempty": 0, "n_empty": 0,
+            "total_items": 0, "total_missing": 0}
+
+
+def update_field_stat(stat: dict, field_res: dict):
+    if field_res["n_items"] == 0:
+        stat["n_empty"] += 1
+    else:
+        stat["n_nonempty"] += 1
+        stat["total_items"] += field_res["n_items"]
+        stat["total_missing"] += field_res["n_missing"]
+        stat["bucket"][bucket_of(field_res["miss_rate"])] += 1
+
+
+def print_field_distribution(field: str, stat: dict):
+    n_nonempty = stat["n_nonempty"]
+    print(f"\n---- 字段 {field} ----")
+    print(f"序列数: {n_nonempty + stat['n_empty']}  (非空 {n_nonempty}, 空 {stat['n_empty']})")
+    if stat["total_items"]:
+        print(f"item 级总缺失率: {stat['total_missing']}/{stat['total_items']} = "
+              f"{stat['total_missing'] / stat['total_items'] * 100:.2f}%")
+    print("每条序列缺失率直方图（分母=非空序列数）:")
     print(f"  {'缺失率区间':<16} {'序列数':>10} {'占比':>10}")
     for label in BUCKET_LABELS:
-        cnt = bucket_counter.get(label, 0)
+        cnt = stat["bucket"].get(label, 0)
         ratio = (cnt / n_nonempty * 100) if n_nonempty else 0.0
         print(f"  {label:<16} {cnt:>10} {ratio:>9.2f}%")
-    print("====================================================================\n")
 
 
 def print_filter_summary(keep_switch: bool, n_total: int, n_kept: int,
                          n_drop_empty: int, n_drop_missing: int):
-    print("================ 过滤汇总（keep_only_full_match={}）================"
+    print("\n================ 过滤汇总（keep_only_full_match={}）================"
           .format("on" if keep_switch else "off"))
-    pct = lambda x: (x / n_total * 100) if n_total else 0.0
+
+    def pct(x):
+        return (x / n_total * 100) if n_total else 0.0
+
     print(f"处理样本总数: {n_total}")
-    print(f"  保留(非空且全命中): {n_kept}  ({pct(n_kept):.2f}%)")
-    print(f"  丢弃合计:          {n_total - n_kept}  ({pct(n_total - n_kept):.2f}%)")
-    print(f"    - 空序列:        {n_drop_empty}  ({pct(n_drop_empty):.2f}%)")
-    print(f"    - 含缺失:        {n_drop_missing}  ({pct(n_drop_missing):.2f}%)")
+    print(f"  保留(非空字段零缺失): {n_kept}  ({pct(n_kept):.2f}%)")
+    print(f"  丢弃合计:            {n_total - n_kept}  ({pct(n_total - n_kept):.2f}%)")
+    print(f"    - 全空(所有字段皆空):  {n_drop_empty}  ({pct(n_drop_empty):.2f}%)")
+    print(f"    - 有缺失(某非空字段缺): {n_drop_missing}  ({pct(n_drop_missing):.2f}%)")
     if not keep_switch:
         print("  （开关关闭：以上仅为统计，未实际过滤）")
     print("====================================================================\n")
@@ -146,6 +171,7 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), "..", "common.conf"
     )
     cfg = load_config(conf_path)
+    seq_fields = cfg["seq_fields"]
     item_map_path = get_item_map_path(conf_path)
 
     print(f"[INFO] 加载映射表: {item_map_path}")
@@ -155,14 +181,11 @@ def main():
     keep_switch = cfg["keep_only_full_match"]
     unlimited = cfg["max_num"] == -1
     max_desc = "全量窗口数据" if unlimited else str(cfg["max_num"])
+    print(f"[INFO] 序列字段: {seq_fields}")
     print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行")
     print(f"[INFO] keep_only_full_match = {'on' if keep_switch else 'off'}\n")
 
-    bucket_counter = Counter()
-    n_nonempty = 0
-    n_empty = 0
-    total_items = 0
-    total_missing = 0
+    field_stats = {f: new_field_stat() for f in seq_fields}
     n = 0
     n_kept = 0
     n_drop_empty = 0
@@ -170,22 +193,17 @@ def main():
     printed = 0
 
     for dt, hdfs_path, _schema, row in stream_rows(cfg):
-        mapped = map_sample(row, id2sid)
-        keep = is_full_match(mapped)
+        mapped = map_sample(row, id2sid, seq_fields)
+        keep = is_full_match(mapped, seq_fields)
 
-        # 诊断统计：始终基于全部处理样本
-        if mapped["n_items"] == 0:
-            n_empty += 1
-        else:
-            n_nonempty += 1
-            total_items += mapped["n_items"]
-            total_missing += mapped["n_missing"]
-            bucket_counter[bucket_of(mapped["miss_rate"])] += 1
+        # 诊断统计：每个字段各自累计（基于全部处理样本）
+        for f in seq_fields:
+            update_field_stat(field_stats[f], mapped["fields"][f])
 
-        # 过滤计数
+        # 过滤计数（样本级）
         if keep:
             n_kept += 1
-        elif mapped["n_items"] == 0:
+        elif all(mapped["fields"][f]["n_items"] == 0 for f in seq_fields):
             n_drop_empty += 1
         else:
             n_drop_missing += 1
@@ -205,7 +223,10 @@ def main():
             print(f"[INFO] 已处理 {n} 行")
 
     print(f"[INFO] 实际处理 {n} 行")
-    print_distribution(bucket_counter, n_nonempty, n_empty, total_items, total_missing)
+    print("\n================ 缺失率分布（诊断，按字段独立统计）================")
+    for f in seq_fields:
+        print_field_distribution(f, field_stats[f])
+    print("\n====================================================================")
     print_filter_summary(keep_switch, n, n_kept, n_drop_empty, n_drop_missing)
 
 
