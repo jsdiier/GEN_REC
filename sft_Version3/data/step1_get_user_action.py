@@ -86,8 +86,7 @@ def load_config(conf_path: str) -> dict:
         "train_end": cp.get("data", "train_end"),
         "max_num": cp.getint("data", "max_num"),
         "log_sample_count": cp.getint("data", "log_sample_count", fallback=3),
-        "keep_only_full_match": cp.getboolean("data", "keep_only_full_match",
-                                              fallback=True),
+        "clean_mode": cp.get("data", "clean_mode", fallback="drop_missing"),
         "seq_fields": [s.strip() for s in
                        cp.get("data", "seq_fields",
                               fallback="u_pay_item_seq_100").split(",")
