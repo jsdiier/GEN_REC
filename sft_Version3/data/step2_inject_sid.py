@@ -24,6 +24,7 @@ import json
 import math
 import configparser
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 
 try:
     import pyarrow.parquet as pq
@@ -62,6 +63,29 @@ def load_item_sid_map(path: str) -> dict:
 # ------------------------------------------------------------------
 # 映射单条样本（多字段，各自独立）
 # ------------------------------------------------------------------
+def get_meal_period(hour: int) -> str:
+    """3 档时段：早餐 bf / 午餐 lc / 晚餐+夜宵 dn。"""
+    if 6 <= hour < 11:
+        return "bf"    # 早餐 6:00-11:00
+    elif 11 <= hour < 16:
+        return "lc"    # 午餐 11:00-16:00
+    else:
+        return "dn"    # 晚餐+夜宵 16:00-次日 6:00
+
+
+def local_time_and_period(phone_time_local, tz_offset_hours: int):
+    """phone_time_local(UTC 毫秒/秒戳) -> (本地 '%Y-%m-%d %H:%M' 字符串, meal_period)。
+    无法解析时返回 (None, None)。"""
+    try:
+        ts = int(phone_time_local)
+    except (TypeError, ValueError):
+        return None, None
+    if ts > 1e11:  # 13 位毫秒 -> 秒
+        ts = ts / 1000.0
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(hours=tz_offset_hours)
+    return dt.strftime("%Y-%m-%d %H:%M"), get_meal_period(dt.hour)
+
+
 def map_field(seq_str: str, id2sid: dict) -> dict:
     """映射单个序列字段，返回该字段的 geo_sid 序列与缺失统计。"""
     items = parse_item_seq(seq_str)
@@ -75,7 +99,9 @@ def map_field(seq_str: str, id2sid: dict) -> dict:
             missing += 1
             sid = None
         geo_seq.append(sid)
-        mapped_items.append({"item_id": iid, "geo_sid": sid, "title": it.get("title")})
+        mapped_items.append({"item_id": iid, "geo_sid": sid,
+                             "local_hour": it.get("local_hour"),
+                             "phone_time_local": it.get("phone_time_local")})
     n = len(items)
     return {
         "n_items": n,
@@ -94,17 +120,29 @@ def map_sample(row: dict, id2sid: dict, seq_fields: list) -> dict:
     }
 
 
-def clean_mapped(mapped: dict, seq_fields: list) -> dict:
-    """drop_missing 清洗视图：每个字段剔掉缺失 item，保留其余 geo_sid。"""
+def clean_mapped(mapped: dict, seq_fields: list, tz_offset_hours: int) -> dict:
+    """drop_missing 清洗视图：每个字段剔掉缺失 item，其余组成 token_info（List[Dict]）。
+    每个 token 含 item_id / geo_sid / phone_time_local_str / meal_period。"""
     out = {"uid": mapped["uid"], "fields": {}}
     for f in seq_fields:
         fr = mapped["fields"][f]
-        clean = [s for s in fr["geo_sid_seq"] if s]
+        token_info = []
+        for it in fr["items"]:
+            if not it["geo_sid"]:
+                continue  # 剔除找不到 geo_sid 的交互
+            s, mp = local_time_and_period(it["phone_time_local"], tz_offset_hours)
+            token_info.append({
+                "item_id": it["item_id"],
+                "geo_sid": it["geo_sid"],
+                "local_hour": it["local_hour"],
+                "phone_time_local_str": s,
+                "meal_period": mp,
+            })
         out["fields"][f] = {
             "len_before": fr["n_items"],
-            "len_after": len(clean),
+            "len_after": len(token_info),
             "removed": fr["n_missing"],
-            "geo_sid_seq": clean,
+            "token_info": token_info,
         }
     return out
 
@@ -284,7 +322,8 @@ def main():
                 n_all_empty_after += 1
             if printed < cfg["log_sample_count"]:
                 print(f"---------- 清洗样本 #{printed + 1}  (dt={dt}, part={os.path.basename(hdfs_path)}) ----------")
-                print(json.dumps(clean_mapped(mapped, seq_fields), ensure_ascii=False, default=str))
+                print(json.dumps(clean_mapped(mapped, seq_fields, cfg["tz_offset_hours"]),
+                                 ensure_ascii=False, default=str))
                 print()
                 printed += 1
 
