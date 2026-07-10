@@ -89,6 +89,8 @@ def load_config(conf_path: str) -> dict:
         "clean_mode": cp.get("data", "clean_mode", fallback="drop_missing"),
         "tz_offset_hours": cp.getint("data", "tz_offset_hours", fallback=-6),
         "session_granularity": cp.get("data", "session_granularity", fallback="day"),
+        "train_label_scope": cp.get("data", "train_label_scope", fallback="slide"),
+        "behavior_drop_x": cp.getint("data", "behavior_drop_x", fallback=3),
         "seq_fields": [s.strip() for s in
                        cp.get("data", "seq_fields",
                               fallback="u_pay_item_seq_100").split(",")
