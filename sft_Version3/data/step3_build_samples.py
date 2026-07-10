@@ -3,7 +3,8 @@
 """
 step3_build_samples（GAMER 对齐版）: session 粒度留一法 + user-level 全序列 train + behavior-drop 增强。
 
-流程（不落盘、全程流式）：
+流程（全程流式；[data] samples_out_dir 配置后把样本写成 train.jsonl / val.jsonl
+供 train/dataset 读取，落盘只留 (action, geo_sid)，留空则仅打印诊断）：
   1. 内存链式复用 step2 的 map_sample 拿到每个用户的 pay/clk 映射；
   2. 合并 pay+clk 成一条按时间排序的时间线，每 token 带 action（clk/pay），
      丢弃找不到 geo_sid 的交互；
@@ -40,6 +41,7 @@ step3_build_samples（GAMER 对齐版）: session 粒度留一法 + user-level �
 
 import os
 import sys
+import json
 import random
 from collections import Counter
 
@@ -103,6 +105,11 @@ def sessionize_by_day(timeline: list) -> list:
 
 def _fmt_tok(t: dict) -> str:
     return f"<{t['action']}>{t['geo_sid']}"
+
+
+def _slim(tokens: list) -> list:
+    """token dict 列表 -> [(action, geo_sid), ...]，落盘只留模型需要的两个字段。"""
+    return [(t["action"], t["geo_sid"]) for t in tokens]
 
 
 def positives_by_action(label_tokens: list) -> dict:
@@ -240,6 +247,17 @@ def main():
           f"最高层行为 {HIGHEST_BEHAVIOR} 不丢；与原始相同的变体跳过）")
     print(f"[INFO] train 区域最少交互数 min_train_seq_len={min_train_seq_len}"
           f"（不足的用户只出 val 不出 train）")
+    out_dir = cfg["samples_out_dir"]
+    writers = None
+    if out_dir:
+        if not os.path.isabs(out_dir):
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(conf_path)), out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        writers = {sp: open(os.path.join(out_dir, f"{sp}.jsonl"), "w", encoding="utf-8")
+                   for sp in ("train", "val")}
+        print(f"[INFO] 样本落盘: {out_dir}/{{train,val}}.jsonl")
+    else:
+        print("[INFO] samples_out_dir 未配置，仅打印诊断不落盘")
     print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行\n")
 
     n = 0
@@ -268,8 +286,16 @@ def main():
             if s["split"] == "train":
                 train_seq_len[s["aug_r"]] += len(s["token_seq"])
                 train_seq_cnt[s["aug_r"]] += 1
+                rec = {"uid": s["uid"], "aug_r": s["aug_r"],
+                       "token_seq": _slim(s["token_seq"])}
             else:
                 total_pos[s["split"]] += len(s["label_tokens"])
+                rec = {"uid": s["uid"], "input": _slim(s["input"]),
+                       "label_tokens": _slim(s["label_tokens"]),
+                       "positives_by_action": s["positives_by_action"],
+                       "label_date": s["label_date"]}
+            if writers:
+                writers[s["split"]].write(json.dumps(rec, ensure_ascii=False) + "\n")
         if samples and printed < cfg["log_sample_count"]:
             print_user_samples(row.get("uid"), sessions, samples)
             printed += 1
@@ -298,6 +324,10 @@ def main():
     cnt = split_samples.get("val", 0)
     avg = (total_pos.get("val", 0) / cnt) if cnt else 0.0
     print(f"  val  : {cnt} 条  (平均 label 区交互数 {avg:.2f})")
+    if writers:
+        for sp, w in writers.items():
+            w.close()
+        print(f"已落盘: {out_dir}/train.jsonl, {out_dir}/val.jsonl")
     print("=====================================")
 
 
