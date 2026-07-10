@@ -76,7 +76,34 @@ def load_train_config(conf_path: str) -> dict:
         "seed": cp.getint("train", "seed", fallback=42),
         "num_workers": cp.getint("train", "num_workers", fallback=2),
         "log_every": cp.getint("train", "log_every", fallback=50),
+        "wandb_project": cp.get("train", "wandb_project", fallback="").strip(),
+        "wandb_run_name": cp.get("train", "wandb_run_name", fallback="").strip(),
     }
+
+
+def init_wandb(tc: dict, model_cfg) -> "object":
+    """wandb_project 配置了才开启；wandb 未安装或未登录时降级为警告，不阻塞训练。
+       API key 从环境读（wandb login / WANDB_API_KEY），不进配置文件。"""
+    if not tc["wandb_project"]:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("[WARN] wandb 未安装（pip install wandb），跳过监控")
+        return None
+    try:
+        run = wandb.init(
+            project=tc["wandb_project"],
+            name=tc["wandb_run_name"] or
+            f"gamer-{tc['data_mode']}-{time.strftime('%m%d-%H%M')}",
+            config={**{k: v for k, v in tc.items() if not k.startswith("wandb")},
+                    "model": asdict(model_cfg)},
+        )
+        print(f"[INFO] wandb 已开启: {run.url}")
+        return run
+    except Exception as e:                      # 未登录 / 网络不通等
+        print(f"[WARN] wandb 初始化失败，跳过监控: {e}")
+        return None
 
 
 def build_scheduler(optimizer, total_steps: int, warmup_ratio: float,
@@ -208,6 +235,7 @@ def main():
           f"总步数={total_steps}  有效batch={tc['batch_size'] * tc['grad_accum']}")
 
     os.makedirs(tc["output_dir"], exist_ok=True)
+    wb = init_wandb(tc, cfg)
     best_val, best_epoch, bad_epochs = float("inf"), -1, 0
     global_step = 0
     model.train()
@@ -241,6 +269,10 @@ def main():
             if pending == tc["grad_accum"]:
                 pending = 0
                 _optim_step()
+                if wb:
+                    wb.log({"train/loss": loss.item(),
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "epoch": epoch}, step=global_step)
                 if global_step % tc["log_every"] == 0:
                     print(f"  epoch {epoch} step {global_step} "
                           f"loss={loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e}")
@@ -259,6 +291,9 @@ def main():
             bad_epochs += 1
         save_checkpoint(os.path.join(tc["output_dir"], "last.pt"),
                         model, cfg, epoch, val_loss)
+        if wb:
+            wb.log({"train/epoch_loss": train_loss, "val/loss": val_loss,
+                    "val/best_loss": best_val, "epoch": epoch}, step=global_step)
         print(f"[EPOCH {epoch}/{tc['epochs']}] train_loss={train_loss:.4f} "
               f"val_loss={val_loss:.4f} ({time.time() - t0:.1f}s){mark}")
 
@@ -266,6 +301,10 @@ def main():
             print(f"[INFO] val loss 连续 {tc['patience']} 个 epoch 无改善，早停")
             break
 
+    if wb:
+        wb.summary["best_val_loss"] = best_val
+        wb.summary["best_epoch"] = best_epoch
+        wb.finish()
     print(f"\n[DONE] best val_loss={best_val:.4f} @ epoch {best_epoch}  "
           f"checkpoint: {tc['output_dir']}/best.pt")
 
