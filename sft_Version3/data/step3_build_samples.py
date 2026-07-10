@@ -193,6 +193,32 @@ def build_all_samples(uid: str, sessions: list, behavior_drop_x: int,
     return out
 
 
+def iter_user_samples(cfg: dict, conf_path: str, part_filter=None,
+                      id2sid: dict = None, verbose: bool = True):
+    """流式产出 (uid, sessions, samples)：step1 取数 -> step2 映射 -> 按天切 session ->
+       build_all_samples。max_num 早停在此处理。
+       本文件 main()（诊断/落盘）与 train/dataset/stream_dataset（流式训练）共用这一份逻辑。
+       part_filter 透传给 stream_rows 做多 worker 的 part 文件分片。"""
+    if id2sid is None:
+        id2sid = load_item_sid_map(get_item_map_path(conf_path))
+    seq_fields = cfg["seq_fields"]
+    tz_offset = cfg["tz_offset_hours"]
+    unlimited = cfg["max_num"] == -1
+    n = 0
+    for _dt, _hdfs, _schema, row in stream_rows(cfg, part_filter=part_filter,
+                                                verbose=verbose):
+        mapped = map_sample(row, id2sid, seq_fields)
+        timeline = build_timeline(mapped, seq_fields, tz_offset)
+        sessions = sessionize_by_day(timeline)
+        yield row.get("uid"), sessions, build_all_samples(
+            row.get("uid"), sessions, cfg["behavior_drop_x"], cfg["min_train_seq_len"])
+        n += 1
+        if not unlimited and n >= cfg["max_num"]:
+            break
+        if verbose and unlimited and n % 100000 == 0:
+            print(f"[INFO] 已处理 {n} 行")
+
+
 def print_user_samples(uid: str, sessions: list, samples: list):
     m = len(sessions)
     print(f"\n========== 用户 uid={uid}  共 {m} 个 session ==========")
@@ -260,7 +286,6 @@ def main():
         print("[INFO] samples_out_dir 未配置，仅打印诊断不落盘")
     print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行\n")
 
-    n = 0
     n_users = 0
     n_users_kept = 0                  # m>=2 被保留的用户
     session_hist = Counter()          # 每用户 session 数分布
@@ -270,15 +295,9 @@ def main():
     train_seq_cnt = Counter()         # {aug_r: 序列条数}
     printed = 0
 
-    for _dt, _hdfs, _schema, row in stream_rows(cfg):
-        mapped = map_sample(row, id2sid, seq_fields)
-        timeline = build_timeline(mapped, seq_fields, tz_offset)
-        sessions = sessionize_by_day(timeline)
+    for uid, sessions, samples in iter_user_samples(cfg, conf_path, id2sid=id2sid):
         n_users += 1
         session_hist[min(len(sessions), 5)] += 1
-
-        samples = build_all_samples(row.get("uid"), sessions,
-                                    behavior_drop_x, min_train_seq_len)
         if samples:
             n_users_kept += 1
         for s in samples:
@@ -297,14 +316,8 @@ def main():
             if writers:
                 writers[s["split"]].write(json.dumps(rec, ensure_ascii=False) + "\n")
         if samples and printed < cfg["log_sample_count"]:
-            print_user_samples(row.get("uid"), sessions, samples)
+            print_user_samples(uid, sessions, samples)
             printed += 1
-
-        n += 1
-        if not unlimited and n >= cfg["max_num"]:
-            break
-        if unlimited and n % 100000 == 0:
-            print(f"[INFO] 已处理 {n} 行")
 
     print("\n================ 汇总 ================")
     print(f"处理用户数: {n_users}  (保留 m>=2: {n_users_kept}, "

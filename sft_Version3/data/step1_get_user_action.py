@@ -154,17 +154,22 @@ def cat_parquet_to_reader(hadoop_bin: str, hdfs_path: str) -> "pa.BufferReader":
     return pa.BufferReader(ret.stdout)
 
 
-def stream_rows(cfg: dict, batch_size: int = 1024):
+def stream_rows(cfg: dict, batch_size: int = 1024, part_filter=None, verbose: bool = True):
     """
     生成器：在窗口内逐 dt、逐 part 流式产出 (dt, hdfs_path, schema, row)。
     max_num 早停由调用方负责计数。
+    part_filter(hdfs_path)->bool 可选：多 DataLoader worker 按 part 文件分片，
+    每个 worker 只 cat 命中的分片，避免重复读 HDFS；verbose=False 时静默（worker 内用）。
     """
     for dt in daterange(cfg["train_start"], cfg["train_end"]):
         hdfs_dir = build_partition_dir(cfg, dt)
         part_files = list_part_files(cfg["hadoop_bin"], hdfs_dir)
+        if part_filter:
+            part_files = [p for p in part_files if part_filter(p)]
         if not part_files:
             continue
-        print(f"[INFO] dt={dt}: 发现 {len(part_files)} 个 part 文件")
+        if verbose:
+            print(f"[INFO] dt={dt}: 处理 {len(part_files)} 个 part 文件")
         for hdfs_path in part_files:
             reader = cat_parquet_to_reader(cfg["hadoop_bin"], hdfs_path)
             pf = pq.ParquetFile(reader)

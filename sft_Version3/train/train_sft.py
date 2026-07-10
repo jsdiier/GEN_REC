@@ -5,7 +5,11 @@ train_sft: GAMER 从零训练循环（对齐论文 4.1.4 的训练配置）。
 
 流程：
   1. 读 common.conf [train]；加载 vocab.json 建 SIDTokenizer；
-  2. GAMERJsonlDataset(train/val) + GAMERCollator -> DataLoader；
+  2. 数据接入按 data_mode 二选一：
+       jsonl : GAMERJsonlDataset 读 step3 落盘文件（小规模调试）
+       stream: GAMERStreamingTrainDataset 在 DataLoader worker 内直连 HDFS
+               流式生成（TB 级不落盘）；val 启动时抽样收集一次常驻内存；
+               lr 调度的总步数用 est_steps_per_epoch 估算；
   3. GAMERModel（配置由 tokenizer 推导：vocab_size / tokens_per_item / behavior_levels）；
   4. AdamW + 线性 warmup(4%) + 余弦衰减到 min_lr；
   5. 逐 epoch：train 全 token 监督 NTP；epoch 末跑 val（teacher-forcing，只算 label 区，
@@ -52,6 +56,11 @@ def load_train_config(conf_path: str) -> dict:
         return p if os.path.isabs(p) else os.path.join(root, p)
 
     return {
+        "data_mode": cp.get("train", "data_mode", fallback="jsonl"),
+        "shuffle_buffer": cp.getint("train", "shuffle_buffer", fallback=10000),
+        "val_sample_rate": cp.getfloat("train", "val_sample_rate", fallback=0.05),
+        "max_val_users": cp.getint("train", "max_val_users", fallback=20000),
+        "est_steps_per_epoch": cp.getint("train", "est_steps_per_epoch", fallback=1000),
         "samples_dir": path("samples_dir", "outputs/samples"),
         "vocab_path": path("vocab_path", "outputs/vocab.json"),
         "output_dir": path("output_dir", "outputs/ckpt"),
@@ -147,17 +156,36 @@ def main():
     tok = SIDTokenizer.load(tc["vocab_path"])
     print(f"[INFO] vocab_size={tok.vocab_size}  num_levels={tok.num_levels}  "
           f"behaviors={tok.behaviors}")
-    train_ds = GAMERJsonlDataset(os.path.join(tc["samples_dir"], "train.jsonl"),
-                                 tok, "train", max_len=tc["max_len"])
-    val_ds = GAMERJsonlDataset(os.path.join(tc["samples_dir"], "val.jsonl"),
-                               tok, "val", max_len=tc["max_len"])
-    print(f"[INFO] train={len(train_ds)} 条序列  val={len(val_ds)} 条")
     coll = GAMERCollator(pad_id=tok.pad_id)
-    train_dl = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
-                          collate_fn=coll, num_workers=tc["num_workers"],
-                          pin_memory=(device == "cuda"), drop_last=False)
+    if tc["data_mode"] == "stream":
+        # 流式：train 直连 HDFS（IterableDataset，worker 按 part 分片）；
+        # val 启动时抽样收集一次，常驻内存
+        from dataset import GAMERStreamingTrainDataset, collect_val_samples
+        train_ds = GAMERStreamingTrainDataset(conf_path, tok, max_len=tc["max_len"],
+                                              shuffle_buffer=tc["shuffle_buffer"],
+                                              seed=tc["seed"])
+        val_ds = GAMERJsonlDataset(None, tok, "val", max_len=tc["max_len"],
+                                   samples=collect_val_samples(
+                                       conf_path, tc["val_sample_rate"],
+                                       tc["max_val_users"]))
+        print(f"[INFO] data_mode=stream  val={len(val_ds)} 条（内存）  "
+              f"train 条数未知（流式）")
+        train_dl = DataLoader(train_ds, batch_size=tc["batch_size"],
+                              collate_fn=coll, num_workers=tc["num_workers"],
+                              pin_memory=(device == "cuda"))
+        steps_per_epoch = tc["est_steps_per_epoch"]
+    else:
+        train_ds = GAMERJsonlDataset(os.path.join(tc["samples_dir"], "train.jsonl"),
+                                     tok, "train", max_len=tc["max_len"])
+        val_ds = GAMERJsonlDataset(os.path.join(tc["samples_dir"], "val.jsonl"),
+                                   tok, "val", max_len=tc["max_len"])
+        print(f"[INFO] data_mode=jsonl  train={len(train_ds)} 条序列  val={len(val_ds)} 条")
+        train_dl = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
+                              collate_fn=coll, num_workers=tc["num_workers"],
+                              pin_memory=(device == "cuda"), drop_last=False)
+        steps_per_epoch = math.ceil(len(train_dl) / tc["grad_accum"])
     val_dl = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
-                        collate_fn=coll, num_workers=tc["num_workers"],
+                        collate_fn=coll, num_workers=0,
                         pin_memory=(device == "cuda"))
 
     # 模型（结构参数由 tokenizer 推导）
@@ -170,13 +198,13 @@ def main():
     model = GAMERModel(cfg).to(device)
     print(f"[INFO] 模型参数量: {model.num_parameters() / 1e6:.2f}M")
 
-    steps_per_epoch = math.ceil(len(train_dl) / tc["grad_accum"])
     total_steps = steps_per_epoch * tc["epochs"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"],
                                   weight_decay=tc["weight_decay"])
     scheduler = build_scheduler(optimizer, total_steps, tc["warmup_ratio"],
                                 tc["lr"], tc["min_lr"])
-    print(f"[INFO] epochs={tc['epochs']}  steps/epoch={steps_per_epoch}  "
+    est = "（估算，stream 模式）" if tc["data_mode"] == "stream" else ""
+    print(f"[INFO] epochs={tc['epochs']}  steps/epoch={steps_per_epoch}{est}  "
           f"总步数={total_steps}  有效batch={tc['batch_size'] * tc['grad_accum']}")
 
     os.makedirs(tc["output_dir"], exist_ok=True)
@@ -187,8 +215,18 @@ def main():
     for epoch in range(1, tc["epochs"] + 1):
         t0 = time.time()
         epoch_loss, epoch_tokens = 0.0, 0
+        pending = 0                                  # 未 step 的累积 micro-batch 数
         optimizer.zero_grad(set_to_none=True)
-        for it, batch in enumerate(train_dl, start=1):
+
+        def _optim_step():
+            nonlocal global_step
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+
+        for batch in train_dl:                       # 不依赖 len()，兼容 IterableDataset
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             with autocast_ctx():
                 loss, _ = model(**batch)
@@ -197,15 +235,15 @@ def main():
             epoch_loss += loss.item() * n_valid
             epoch_tokens += n_valid
 
-            if it % tc["grad_accum"] == 0 or it == len(train_dl):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+            pending += 1
+            if pending == tc["grad_accum"]:
+                pending = 0
+                _optim_step()
                 if global_step % tc["log_every"] == 0:
                     print(f"  epoch {epoch} step {global_step} "
                           f"loss={loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e}")
+        if pending:                                  # epoch 末尾不足 grad_accum 的余量
+            _optim_step()
 
         train_loss = epoch_loss / max(epoch_tokens, 1)
         val_loss = evaluate(model, val_dl, device, autocast_ctx)
