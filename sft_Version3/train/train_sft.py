@@ -33,6 +33,7 @@ import configparser
 from dataclasses import asdict
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "model"))
@@ -122,23 +123,56 @@ def build_scheduler(optimizer, total_steps: int, warmup_ratio: float,
 
 
 # ------------------------------------------------------------------
-# 评估：val loss（teacher-forcing，按有效 token 数加权）
+# 评估：val loss（teacher-forcing，按有效 token 数加权）+ 按 token 位分解
 # ------------------------------------------------------------------
+def build_slot_defs(tok, device) -> dict:
+    """token 位定义：{位名: (token_types 取值, 该位合法 token id 张量)}。
+       behavior=行为位；sid1..sidl=SID 各层（sid1=geo, sid2=a, ...）。"""
+    defs = {"behavior": (0, torch.tensor(
+        [tok.token2id[f"<{b}>"] for b in tok.behaviors], device=device))}
+    for j, ids in enumerate(tok.level_token_ids, start=1):
+        defs[f"sid{j}"] = (j, torch.tensor(ids, device=device))
+    return defs
+
+
 @torch.no_grad()
-def evaluate(model, val_dl, device, autocast_ctx) -> float:
+def evaluate(model, val_dl, device, autocast_ctx, slot_defs=None):
+    """返回 (总 val loss, {位名: (loss, class_mass)})。
+       - 分位 loss：只有该位的语义预测能力，剥离"结构学习"的水分
+         （sid2/3/4 贴着 ln(类内大小)≈5.55 不动 = 没学到 item 语义，只在学结构）；
+       - class_mass：模型放在该位【正确类别】上的概率质量，->1 表示结构已学完。"""
     model.eval()
     total_loss, total_tokens = 0.0, 0
+    slot_stats = {n: [0.0, 0.0, 0] for n in (slot_defs or {})}   # [loss和, mass和, 数量]
     for batch in val_dl:
         batch = {k: v.to(device) for k, v in batch.items()}
-        n_valid = (batch["labels"][:, 1:] != -100).sum().item()  # 与模型内部 shift 一致
-        if n_valid == 0:
+        labels = batch["labels"][:, 1:]                          # 与模型内部 shift 对齐
+        valid = labels != -100
+        if not valid.any():
             continue
         with autocast_ctx():
-            loss, _ = model(**batch)
-        total_loss += loss.item() * n_valid
-        total_tokens += n_valid
+            _, logits = model(**batch)
+        logits = logits[:, :-1].float()                          # (B, L-1, V)
+        ce = F.cross_entropy(logits.flatten(0, 1), labels.clamp(min=0).flatten(),
+                             reduction="none").view_as(labels)
+        total_loss += ce[valid].sum().item()
+        total_tokens += valid.sum().item()
+
+        if slot_defs:
+            types = batch["token_types"][:, 1:]                  # 目标 token 的位类型
+            for name, (tval, ids) in slot_defs.items():
+                m = valid & (types == tval)
+                if not m.any():
+                    continue
+                st = slot_stats[name]
+                st[0] += ce[m].sum().item()
+                lg = logits[m]                                   # (n, V)
+                mass = (lg[:, ids].logsumexp(-1) - lg.logsumexp(-1)).exp()
+                st[1] += mass.sum().item()
+                st[2] += m.sum().item()
     model.train()
-    return total_loss / max(total_tokens, 1)
+    per_slot = {n: (s[0] / s[2], s[1] / s[2]) for n, s in slot_stats.items() if s[2]}
+    return total_loss / max(total_tokens, 1), per_slot
 
 
 def save_checkpoint(path: str, model, cfg: GAMERConfig, epoch: int, val_loss: float):
@@ -235,6 +269,7 @@ def main():
           f"总步数={total_steps}  有效batch={tc['batch_size'] * tc['grad_accum']}")
 
     os.makedirs(tc["output_dir"], exist_ok=True)
+    slot_defs = build_slot_defs(tok, device)
     wb = init_wandb(tc, cfg)
     best_val, best_epoch, bad_epochs = float("inf"), -1, 0
     global_step = 0
@@ -280,7 +315,7 @@ def main():
             _optim_step()
 
         train_loss = epoch_loss / max(epoch_tokens, 1)
-        val_loss = evaluate(model, val_dl, device, autocast_ctx)
+        val_loss, per_slot = evaluate(model, val_dl, device, autocast_ctx, slot_defs)
         mark = ""
         if val_loss < best_val:
             best_val, best_epoch, bad_epochs = val_loss, epoch, 0
@@ -292,10 +327,17 @@ def main():
         save_checkpoint(os.path.join(tc["output_dir"], "last.pt"),
                         model, cfg, epoch, val_loss)
         if wb:
-            wb.log({"train/epoch_loss": train_loss, "val/loss": val_loss,
-                    "val/best_loss": best_val, "epoch": epoch}, step=global_step)
+            log = {"train/epoch_loss": train_loss, "val/loss": val_loss,
+                   "val/best_loss": best_val, "epoch": epoch}
+            for name, (sl, sm) in per_slot.items():
+                log[f"val/loss_{name}"] = sl
+                log[f"val/mass_{name}"] = sm
+            wb.log(log, step=global_step)
+        slot_str = "  ".join(f"{n} {sl:.2f}/{sm:.2f}"
+                             for n, (sl, sm) in per_slot.items())
         print(f"[EPOCH {epoch}/{tc['epochs']}] train_loss={train_loss:.4f} "
               f"val_loss={val_loss:.4f} ({time.time() - t0:.1f}s){mark}")
+        print(f"  分位 loss/mass: {slot_str}")
 
         if tc["patience"] > 0 and bad_epochs >= tc["patience"]:
             print(f"[INFO] val loss 连续 {tc['patience']} 个 epoch 无改善，早停")
