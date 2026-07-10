@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-step2: 把用户行为序列（seq_fields，如 u_pay_item_seq_100 / u_clk_item_seq_100）
-里每个 item_id 映射成 geo_sid。多字段「各自独立」处理。
+step2_inject_sid: 把用户行为序列里的 item 映射成 geo_sid，并组装成带时段信息的
+token 序列，同时输出缺失率 / 长度的诊断分布。本步只做映射 + 统计，不落盘。
 
-清洗模式 clean_mode（common.conf [data]）：
-  - drop_missing（默认）: 逐 item 剔除找不到 geo_sid 的交互，保留序列其余部分；
-  - full_match          : 整条丢弃，非空字段零缺失才保留整条样本。
-
-诊断输出（两种模式都打印）：
-  - 每个字段的缺失率分布；
-  - 每个字段「剔除缺失 item 前 / 后」的序列长度分布。
-
-不在映射表中、或映射到空 geo_sid 的 item，都记为缺失。本步只做映射+统计，不落盘。
+依次做的事：
+  1. 读配置 + 加载映射表
+     - 复用 step1 的流式取数（stream_rows）与序列解析（parse_item_seq）；
+     - 从 common.conf [item_map] item_map_path 加载 item_id -> geo_sid 映射（load_item_sid_map）。
+  2. 逐样本流式处理（窗口 + max_num 早停，均来自 common.conf [data]）
+     对每条样本、每个选中序列字段（seq_fields，如 u_pay / u_clk，「各自独立」处理）：
+     a. 解析序列，逐 item 查映射得 geo_sid（map_field）；
+        不在表中 或 映射到空 geo_sid 的 item 记为「缺失」。
+     b. 按 clean_mode 处理缺失（common.conf [data]）：
+        - drop_missing（默认）: 逐 item 剔除缺失交互，保留序列其余部分；
+        - full_match          : 整条丢弃，非空字段零缺失才保留整条样本。
+     c. drop_missing 下把保留的 item 组装成 token_info（List[Dict]，clean_mapped），
+        每个 token 含 item_id / geo_sid / local_hour / phone_time_local_str / meal_period；
+        其中 phone_time_local（UTC 毫秒戳）按 tz_offset_hours 转本地时刻，
+        再由本地小时映射 3 档 meal_period（bf/lc/dn）。
+  3. 累计诊断统计（两种模式都统计全部处理样本，按字段独立）
+     - 缺失率分布：每字段一份缺失率直方图 + item 级总缺失率；
+     - 序列长度分布：每字段「剔除缺失 item 前 / 后」的长度直方图。
+  4. 打印
+     - 前 log_sample_count 条样本（drop_missing 打印清洗后的 token_info；full_match 打印保留样本）；
+     - 缺失率分布、长度分布；
+     - 清洗/过滤汇总（drop_missing 报剔除后全空样本数；full_match 报保留/丢弃数）。
 
 用法:
     python3 step2_inject_sid.py [common.conf]
