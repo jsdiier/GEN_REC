@@ -214,6 +214,8 @@ def main():
 
     for epoch in range(1, tc["epochs"] + 1):
         t0 = time.time()
+        if hasattr(train_ds, "set_epoch"):
+            train_ds.set_epoch(epoch)      # stream 模式：洗牌顺序随 epoch 变化
         epoch_loss, epoch_tokens = 0.0, 0
         pending = 0                                  # 未 step 的累积 micro-batch 数
         optimizer.zero_grad(set_to_none=True)

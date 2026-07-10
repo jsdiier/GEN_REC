@@ -50,7 +50,14 @@ class GAMERStreamingTrainDataset(IterableDataset):
         self.max_len = max_len
         self.shuffle_buffer = max(shuffle_buffer, 1)
         self.seed = seed
+        self._epoch = 0
         self._id2sid = None            # worker 进程内懒加载
+
+    def set_epoch(self, epoch: int):
+        """训练循环每个 epoch 前调用，让洗牌顺序随 epoch 变化。
+           （DataLoader 每个 epoch 重新把 dataset pickle 进 worker，属性随之带入；
+             不调用则每个 epoch 的样本顺序完全相同。）"""
+        self._epoch = epoch
 
     def _train_records(self, part_filter, verbose):
         if self._id2sid is None:
@@ -70,7 +77,7 @@ class GAMERStreamingTrainDataset(IterableDataset):
         if nw > 1:
             part_filter = (lambda p, _w=wid, _n=nw:
                            zlib.crc32(p.encode("utf-8")) % _n == _w)
-        rng = random.Random(self.seed * 1000 + wid)
+        rng = random.Random(self.seed * 1000 + wid + self._epoch * 7919)
         buf = []
         for rec in self._train_records(part_filter, verbose=(wid == 0)):
             if len(buf) < self.shuffle_buffer:
