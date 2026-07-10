@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-step3_build_samples（分割 + label 分割）: session 粒度留一法，构造 train/val/test 样本。
+step3_build_samples（GAMER 对齐版）: session 粒度留一法 + user-level 全序列 train + behavior-drop 增强。
 
 流程（不落盘、全程流式）：
   1. 内存链式复用 step2 的 map_sample 拿到每个用户的 pay/clk 映射；
   2. 合并 pay+clk 成一条按时间排序的时间线，每 token 带 action（clk/pay），
      丢弃找不到 geo_sid 的交互；
   3. 按【本地自然日】切 session（session_granularity=day）：Su=[S1,...,Sm]；
-  4. 留一法三分（每个用户独立）：
-       test :  input = S1..S(m-1)（含 val 的 session），label 区 = Sm
-       val  :  input = S1..S(m-2),                    label 区 = S(m-1)
-       train:  label session 在区域 S1..S(m-2) 内取：
-                 slide(默认) -> S2..S(m-2) 每个 session 轮流当 label，input=它之前的
-                 last        -> 只用 S(m-2) 当 label
-     边界：m<2 无样本；m==2 仅 test；m==3 test+val；m>=4 才有 train。
-  5. label 分割：label 区按「目标行为 b」取正样本集合 𝒯u = 区内以 b 交互的所有 item（去重）。
-     每条样本 = (input, target_action, label_geo_sids 集合)；train 阶段再展开/采样。
-  6. 打印前若干用户的样本拆解 + 各 split 样本量汇总供核对。
+  4. 用户过滤（对齐论文 4.1.1）：session 数 m < 3 的用户整体剔除，不出任何样本；
+  5. 留一法三分（每个用户独立，m>=3）：
+       test :  input = S1..S(m-1)（含 val 的 session）, label 区 = Sm
+       val  :  input = S1..S(m-2),                     label 区 = S(m-1)
+       train:  user-level 全序列 = S1..S(m-2) 按时间原序拼接（保留重复交互），
+               不区分 target_action、不设 label 区——下游做 next-token prediction，
+               labels = input_ids 整体左移，全 token 监督（对齐论文 Eq.6）。
+  6. train 的 behavior-drop 增强（对齐论文 3.3）：x = behavior_drop_x，
+       对整条 train 序列生成 x 个变体，丢弃比例 ri = i/(x+1) (i=1..x)；
+       行为层级 clk=1 < pay=2，最高层 pay 一条不丢，其余行为 b 按比例 ri/L_b 随机丢弃（保序）。
+       每用户共输出 x+1 条 train 序列（原始 + x 个变体）；val/test 不增强。
+  7. val/test 的 label 分割：label 区按「目标行为 b」取正样本集合 𝒯u（去重），
+     每条样本 = (input, target_action, label_geo_sids 集合)，用于 HR/Recall/NDCG 评测。
+  8. 打印前若干用户的样本拆解 + 各 split 样本量汇总供核对。
 
-（train 的 behavior-drop 增强下一步做，且只作用于 train、val/test 不变。）
+与旧版（SFT 式）的差异：
+  - train 不再是 slide/last 的 (input, label集合) 对，train_label_scope 配置已废弃不读；
+  - train 序列保留重复交互（论文 footnote 2），不去重、不采样；
+  - m==2 用户不再出 test 样本（论文剔除 <3 session 用户）。
 
 用法:
     python3 step3_build_samples.py [common.conf]
@@ -27,11 +34,17 @@ step3_build_samples（分割 + label 分割）: session 粒度留一法，构造
 
 import os
 import sys
+import random
 from collections import Counter
 
 from step1_get_user_action import load_config, stream_rows
 from step2_inject_sid import (map_sample, load_item_sid_map,
                               get_item_map_path, local_time_and_period)
+
+
+# 行为层级（对齐论文 3.3：最低层为 1，随行为深度递增；最高层行为不参与 drop）
+BEHAVIOR_LEVELS = {"clk": 1, "pay": 2}
+HIGHEST_BEHAVIOR = max(BEHAVIOR_LEVELS, key=BEHAVIOR_LEVELS.get)
 
 
 def field_to_action(field: str) -> str:
@@ -88,7 +101,7 @@ def _fmt_tok(t: dict) -> str:
 
 def positives_by_action(label_tokens: list) -> dict:
     """label 区按目标行为 b 分组成正样本 geo_sid 集合（去重，保序）。
-       {action: [geo_sid, ...]}。"""
+       {action: [geo_sid, ...]}。仅用于 val/test 评测样本。"""
     g = {}
     for t in label_tokens:
         lst = g.setdefault(t["action"], [])
@@ -97,8 +110,8 @@ def positives_by_action(label_tokens: list) -> dict:
     return g
 
 
-def _make_samples(uid, split, input_tokens, label_date, label_tokens):
-    """label 区内每个目标行为 b 出一条样本：label = 该 b 的正样本集合（下游 train 再展开/采样）。"""
+def _make_eval_samples(uid, split, input_tokens, label_date, label_tokens):
+    """val/test：label 区内每个目标行为 b 出一条样本，label = 该 b 的正样本集合。"""
     samples = []
     for action, geo_sids in positives_by_action(label_tokens).items():
         samples.append({
@@ -112,37 +125,57 @@ def _make_samples(uid, split, input_tokens, label_date, label_tokens):
     return samples
 
 
-def build_all_samples(uid: str, sessions: list, train_label_scope: str) -> list:
-    """session 粒度留一法，构造 train/val/test 样本（label 为正样本集合）。
-       test  : input=S1..S(m-1), label=Sm
-       val   : input=S1..S(m-2), label=S(m-1)
-       train : slide -> S2..S(m-2) 每个 session 当 label；last -> 仅 S(m-2)
+def drop_augment(tokens: list, r: float, rng: random.Random) -> list:
+    """对整条 train 序列做 behavior-drop（论文 3.3）：
+       除最高层行为外，每种行为 b 随机丢弃 round(n_b * r / L_b) 条交互，保序。"""
+    idx_by_action = {}
+    for i, t in enumerate(tokens):
+        if t["action"] != HIGHEST_BEHAVIOR:
+            idx_by_action.setdefault(t["action"], []).append(i)
+    drop_idx = set()
+    for action, idxs in idx_by_action.items():
+        level = BEHAVIOR_LEVELS.get(action, 1)
+        k = round(len(idxs) * r / level)
+        if k > 0:
+            drop_idx.update(rng.sample(idxs, k))
+    return [t for i, t in enumerate(tokens) if i not in drop_idx]
+
+
+def build_train_sequences(uid, sessions: list, x: int) -> list:
+    """train：S1..S(m-2) 原序拼接成一条 user-level 全序列（保留重复交互），
+       外加 x 个 behavior-drop 变体（ri = i/(x+1)）。每用户输出 x+1 条。
+       rng 以 (uid, i) 做种子，保证可复现。"""
+    train_tokens = [t for _, toks in sessions[:-2] for t in toks]
+    if not train_tokens:
+        return []
+    out = [{"uid": uid, "split": "train", "aug_r": 0.0, "token_seq": train_tokens}]
+    for i in range(1, x + 1):
+        r = i / (x + 1)
+        rng = random.Random(f"{uid}|aug{i}")
+        out.append({"uid": uid, "split": "train", "aug_r": round(r, 4),
+                    "token_seq": drop_augment(train_tokens, r, rng)})
+    return out
+
+
+def build_all_samples(uid: str, sessions: list, behavior_drop_x: int) -> list:
+    """session 粒度留一法（m>=3 的用户才保留，对齐论文）：
+       test  : input=S1..S(m-1), label=Sm         （评测样本，label 为正样本集合）
+       val   : input=S1..S(m-2), label=S(m-1)     （评测样本，label 为正样本集合）
+       train : S1..S(m-2) 全序列 + x 个 drop 变体 （NTP 序列，无 label 区）
        （sessions 0-indexed: S1=sessions[0] ... Sm=sessions[m-1]）"""
     m = len(sessions)
-    out = []
-    if m < 2:
-        return out
+    if m < 3:
+        return []  # 论文 4.1.1：session 数不足 3 的用户整体剔除
 
+    out = []
     # test
     test_input = [t for _, toks in sessions[:m - 1] for t in toks]
-    out += _make_samples(uid, "test", test_input, sessions[m - 1][0], sessions[m - 1][1])
-
-    # val (需 m>=3)
-    if m >= 3:
-        val_input = [t for _, toks in sessions[:m - 2] for t in toks]
-        out += _make_samples(uid, "val", val_input, sessions[m - 2][0], sessions[m - 2][1])
-
-    # train：label session 落在 train 区域 S1..S(m-2) 内，且需有更早 session 作 input
-    #   可当 label 的下标 s ∈ [1, m-3]（0-indexed），对应 S2..S(m-2)
-    if m >= 4:
-        if train_label_scope == "last":
-            train_idxs = [m - 3]
-        else:  # slide
-            train_idxs = list(range(1, m - 2))
-        for s in train_idxs:
-            tr_input = [t for _, toks in sessions[:s] for t in toks]
-            out += _make_samples(uid, "train", tr_input, sessions[s][0], sessions[s][1])
-
+    out += _make_eval_samples(uid, "test", test_input, sessions[m - 1][0], sessions[m - 1][1])
+    # val
+    val_input = [t for _, toks in sessions[:m - 2] for t in toks]
+    out += _make_eval_samples(uid, "val", val_input, sessions[m - 2][0], sessions[m - 2][1])
+    # train（user-level 全序列 + 增强）
+    out += build_train_sequences(uid, sessions, behavior_drop_x)
     return out
 
 
@@ -158,13 +191,19 @@ def print_user_samples(uid: str, sessions: list, samples: list):
             role = "[train区域]"
         print(f"  session#{i} {role} date={date}  {len(toks)} 交互: {[_fmt_tok(t) for t in toks]}")
 
-    print(f"\n  生成 {len(samples)} 条样本（input 只展示尾部 3 个交互 + 长度）:")
+    print(f"\n  生成 {len(samples)} 条样本:")
     for s in samples:
-        inp = s["input"]
-        tail = [_fmt_tok(t) for t in inp[-3:]]
-        print(f"    [{s['split']:<5}/{s['target_action']:<3}] "
-              f"input_len={len(inp)} tail={tail} "
-              f"-> label({s['target_action']})@{s['label_date']}: {s['label_geo_sids']}")
+        if s["split"] == "train":
+            seq = s["token_seq"]
+            n_by_action = Counter(t["action"] for t in seq)
+            print(f"    [train/r={s['aug_r']:<6}] seq_len={len(seq)} "
+                  f"({dict(n_by_action)}) seq={[_fmt_tok(t) for t in seq]}")
+        else:
+            inp = s["input"]
+            tail = [_fmt_tok(t) for t in inp[-3:]]
+            print(f"    [{s['split']:<5}/{s['target_action']:<3}] "
+                  f"input_len={len(inp)} tail={tail} "
+                  f"-> label({s['target_action']})@{s['label_date']}: {s['label_geo_sids']}")
     print("=" * 64)
 
 
@@ -175,6 +214,7 @@ def main():
     cfg = load_config(conf_path)
     seq_fields = cfg["seq_fields"]
     tz_offset = cfg["tz_offset_hours"]
+    behavior_drop_x = cfg["behavior_drop_x"]
 
     if cfg["session_granularity"] != "day":
         print(f"[WARN] 目前仅支持 session_granularity=day，收到 "
@@ -185,18 +225,23 @@ def main():
     id2sid = load_item_sid_map(item_map_path)
     print(f"[INFO] 映射表条目数: {len(id2sid)}")
 
-    train_label_scope = cfg["train_label_scope"]
     unlimited = cfg["max_num"] == -1
     max_desc = "全量窗口数据" if unlimited else str(cfg["max_num"])
-    print(f"[INFO] 序列字段: {seq_fields}  session=按天  留一法三分 train/val/test")
-    print(f"[INFO] train_label_scope={train_label_scope}（label 为正样本集合，train 阶段再展开/采样）")
+    print(f"[INFO] 序列字段: {seq_fields}  session=按天  留一法三分（剔除 <3 session 用户）")
+    print(f"[INFO] train = user-level 全序列 NTP（GAMER 式，无 prompt/label 之分）")
+    print(f"[INFO] behavior-drop 增强 x={behavior_drop_x}"
+          f"（ri=i/(x+1)，每用户 {behavior_drop_x + 1} 条 train 序列；"
+          f"最高层行为 {HIGHEST_BEHAVIOR} 不丢）")
     print(f"[INFO] 窗口: {cfg['train_start']} ~ {cfg['train_end']}，期望处理 {max_desc} 行\n")
 
     n = 0
     n_users = 0
+    n_users_kept = 0                  # m>=3 被保留的用户
     session_hist = Counter()          # 每用户 session 数分布
     split_samples = Counter()         # 各 split 样本数
-    total_pos = Counter()             # 各 split 正样本(去重后)累计，估平均集合大小
+    total_pos = Counter()             # val/test 正样本(去重后)累计，估平均集合大小
+    train_seq_len = Counter()         # {aug_r: 累计 token 数}，估平均序列长度
+    train_seq_cnt = Counter()         # {aug_r: 序列条数}
     printed = 0
 
     for _dt, _hdfs, _schema, row in stream_rows(cfg):
@@ -206,10 +251,16 @@ def main():
         n_users += 1
         session_hist[min(len(sessions), 5)] += 1
 
-        samples = build_all_samples(row.get("uid"), sessions, train_label_scope)
+        samples = build_all_samples(row.get("uid"), sessions, behavior_drop_x)
+        if samples:
+            n_users_kept += 1
         for s in samples:
             split_samples[s["split"]] += 1
-            total_pos[s["split"]] += len(s["label_geo_sids"])
+            if s["split"] == "train":
+                train_seq_len[s["aug_r"]] += len(s["token_seq"])
+                train_seq_cnt[s["aug_r"]] += 1
+            else:
+                total_pos[s["split"]] += len(s["label_geo_sids"])
         if samples and printed < cfg["log_sample_count"]:
             print_user_samples(row.get("uid"), sessions, samples)
             printed += 1
@@ -221,13 +272,21 @@ def main():
             print(f"[INFO] 已处理 {n} 行")
 
     print("\n================ 汇总 ================")
-    print(f"处理用户数: {n_users}")
+    print(f"处理用户数: {n_users}  (保留 m>=3: {n_users_kept}, "
+          f"剔除 <3 session: {n_users - n_users_kept})")
     print("每用户 session 数分布:")
     for k in sorted(session_hist):
         label = "5+" if k == 5 else str(k)
         print(f"  {label} 个 session: {session_hist[k]}")
-    print("各 split 样本数（每条样本 = 一个 (input, target_action, 正样本集合)）:")
-    for sp in ("train", "val", "test"):
+    print("train（user-level NTP 序列，每用户 x+1 条）:")
+    for r in sorted(train_seq_cnt):
+        cnt = train_seq_cnt[r]
+        avg = train_seq_len[r] / cnt if cnt else 0.0
+        tag = "原始" if r == 0.0 else f"r={r}"
+        print(f"  {tag:<8}: {cnt} 条  (平均 seq_len {avg:.2f})")
+    print(f"  train 合计: {split_samples.get('train', 0)} 条")
+    print("val/test（评测样本，每条 = (input, target_action, 正样本集合)）:")
+    for sp in ("val", "test"):
         cnt = split_samples.get(sp, 0)
         avg = (total_pos.get(sp, 0) / cnt) if cnt else 0.0
         print(f"  {sp:<5}: {cnt} 条  (平均正样本集合大小 {avg:.2f})")
