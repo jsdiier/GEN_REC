@@ -209,15 +209,17 @@ class PositionBehaviorMoE(nn.Module):
         """x: (B,L,D); token_types: (B,L) 0=行为token, 1..l=SID第j层, -1=非item。"""
         out = torch.zeros_like(x)
         # 行为 token 与非 item token 走 expert_0
+        # （autocast 下专家输出是 bf16 而 out 是 fp32，index_put 要求 dtype 严格一致，
+        #   必须 cast 回 out.dtype）
         m0 = token_types <= 0
         if m0.any():
-            out[m0] = self.expert_beh(x[m0])
+            out[m0] = self.expert_beh(x[m0]).to(out.dtype)
         beh = behavior_ids.clamp(min=0)
         beh_e = self.behavior_emb(beh)                            # (B,L,D)
         for j, expert in enumerate(self.experts_sid, start=1):
             mj = token_types == j
             if mj.any():
-                out[mj] = expert(torch.cat([x[mj], beh_e[mj]], dim=-1))
+                out[mj] = expert(torch.cat([x[mj], beh_e[mj]], dim=-1)).to(out.dtype)
         return out
 
 
