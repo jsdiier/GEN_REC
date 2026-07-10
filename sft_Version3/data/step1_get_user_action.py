@@ -124,15 +124,26 @@ def build_partition_dir(cfg: dict, dt: str) -> str:
     ])
 
 
-def list_part_files(hadoop_bin: str, hdfs_dir: str) -> list:
-    """列出分区下所有 part 文件，按文件名排序保证可复现；分区不存在时返回空。"""
+def fmt_size(n_bytes: int) -> str:
+    """字节数 -> 人类可读（B/KiB/MiB/GiB/TiB）。"""
+    size = float(n_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} TiB"
+
+
+def list_part_files(hadoop_bin: str, hdfs_dir: str) -> tuple:
+    """列出分区下所有 part 文件，按文件名排序保证可复现；分区不存在时返回空。
+       返回 (part 文件路径列表, 分区总字节数)，大小直接取自 `fs -ls` 输出第 5 列。"""
     ret = subprocess.run([hadoop_bin, "fs", "-ls", hdfs_dir],
                          capture_output=True, text=True)
     if ret.returncode != 0:
         print(f"[WARN] 列目录失败（可能该 dt 分区不存在），跳过: {hdfs_dir}\n"
               f"       stderr: {ret.stderr.strip()}")
-        return []
-    files = []
+        return [], 0
+    files, total_bytes = [], 0
     for line in ret.stdout.splitlines():
         parts = line.split()
         if len(parts) < 8:
@@ -140,8 +151,12 @@ def list_part_files(hadoop_bin: str, hdfs_dir: str) -> list:
         path = parts[-1]
         if os.path.basename(path).startswith("part-"):
             files.append(path)
+            try:
+                total_bytes += int(parts[4])
+            except ValueError:
+                pass
     files.sort()
-    return files
+    return files, total_bytes
 
 
 def cat_parquet_to_reader(hadoop_bin: str, hdfs_path: str) -> "pa.BufferReader":
@@ -163,13 +178,16 @@ def stream_rows(cfg: dict, batch_size: int = 1024, part_filter=None, verbose: bo
     """
     for dt in daterange(cfg["train_start"], cfg["train_end"]):
         hdfs_dir = build_partition_dir(cfg, dt)
-        part_files = list_part_files(cfg["hadoop_bin"], hdfs_dir)
+        part_files, total_bytes = list_part_files(cfg["hadoop_bin"], hdfs_dir)
+        n_all = len(part_files)
         if part_filter:
             part_files = [p for p in part_files if part_filter(p)]
         if not part_files:
             continue
         if verbose:
-            print(f"[INFO] dt={dt}: 处理 {len(part_files)} 个 part 文件")
+            shard = (f"，本进程分到 {len(part_files)} 个" if part_filter else "")
+            print(f"[INFO] dt={dt}: {n_all} 个 part 文件，"
+                  f"HDFS 占用 {fmt_size(total_bytes)}{shard}")
         for hdfs_path in part_files:
             reader = cat_parquet_to_reader(cfg["hadoop_bin"], hdfs_path)
             pf = pq.ParquetFile(reader)

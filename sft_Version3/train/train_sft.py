@@ -9,7 +9,7 @@ train_sft: GAMER 从零训练循环（对齐论文 4.1.4 的训练配置）。
        jsonl : GAMERJsonlDataset 读 step3 落盘文件（小规模调试）
        stream: GAMERStreamingTrainDataset 在 DataLoader worker 内直连 HDFS
                流式生成（TB 级不落盘）；val 启动时抽样收集一次常驻内存；
-               lr 调度的总步数用 est_steps_per_epoch 估算；
+               lr 调度总步数 epoch 1 结束后按实测步数自动校准（见 build_scheduler）；
   3. GAMERModel（配置由 tokenizer 推导：vocab_size / tokens_per_item / behavior_levels）；
   4. AdamW + 线性 warmup(4%) + 余弦衰减到 min_lr；
   5. 逐 epoch：train 全 token 监督 NTP；epoch 末跑 val（teacher-forcing，只算 label 区，
@@ -61,7 +61,6 @@ def load_train_config(conf_path: str) -> dict:
         "shuffle_buffer": cp.getint("train", "shuffle_buffer", fallback=10000),
         "val_sample_rate": cp.getfloat("train", "val_sample_rate", fallback=0.05),
         "max_val_users": cp.getint("train", "max_val_users", fallback=20000),
-        "est_steps_per_epoch": cp.getint("train", "est_steps_per_epoch", fallback=1000),
         "samples_dir": path("samples_dir", "outputs/samples"),
         "vocab_path": path("vocab_path", "outputs/vocab.json"),
         "output_dir": path("output_dir", "outputs/ckpt"),
@@ -107,19 +106,44 @@ def init_wandb(tc: dict, model_cfg) -> "object":
         return None
 
 
-def build_scheduler(optimizer, total_steps: int, warmup_ratio: float,
-                    lr: float, min_lr: float):
-    """线性 warmup + 余弦衰减到 min_lr（论文 4.1.4）。"""
-    warmup = max(int(total_steps * warmup_ratio), 1)
+# stream 模式 epoch 1 校准前的临时 warmup 步数（升到峰值 lr 后平顶等待校准）
+PROVISIONAL_WARMUP = 100
+
+
+def build_scheduler(optimizer, epochs: int, warmup_ratio: float,
+                    lr: float, min_lr: float, total_steps: int = None):
+    """线性 warmup + 余弦衰减到 min_lr（论文 4.1.4）。
+
+    总步数的两种来源：
+      - jsonl 模式：启动就知道数据量，传 total_steps 直接精确调度；
+      - stream 模式：启动时不知道每 epoch 步数（取决于 max_num/增强/过滤），
+        epoch 1 先用临时调度（前 PROVISIONAL_WARMUP 步线性升温到峰值后平顶），
+        epoch 1 结束调 scheduler.calibrate(实测 steps/epoch) 后按精确总步数走。
+        校准后若正式 warmup（warmup_ratio*total）尚未走完（epochs > 1/ratio 时），
+        lr 会落回修正后的 warmup 斜率继续升温，属正常衔接。
+    """
+    state = {"total": None, "warmup": None}
 
     def lr_lambda(step):
-        if step < warmup:
-            return step / warmup
-        progress = (step - warmup) / max(total_steps - warmup, 1)
+        if state["total"] is None:                     # 校准前：升温 + 平顶
+            return min((step + 1) / PROVISIONAL_WARMUP, 1.0)
+        if step < state["warmup"]:
+            return (step + 1) / state["warmup"]
+        progress = (step - state["warmup"]) / max(state["total"] - state["warmup"], 1)
         cos = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         return (min_lr + (lr - min_lr) * cos) / lr
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    def calibrate(steps_per_epoch: int):
+        state["total"] = steps_per_epoch * epochs
+        state["warmup"] = max(int(state["total"] * warmup_ratio), 1)
+
+    sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    sched.calibrate = calibrate
+    sched.calibrated = lambda: state["total"] is not None
+    if total_steps is not None:
+        state["total"] = total_steps
+        state["warmup"] = max(int(total_steps * warmup_ratio), 1)
+    return sched
 
 
 # ------------------------------------------------------------------
@@ -234,7 +258,7 @@ def main():
         train_dl = DataLoader(train_ds, batch_size=tc["batch_size"],
                               collate_fn=coll, num_workers=tc["num_workers"],
                               pin_memory=(device == "cuda"))
-        steps_per_epoch = tc["est_steps_per_epoch"]
+        steps_per_epoch = None                  # epoch 1 实测后校准 lr 调度
     else:
         train_ds = GAMERJsonlDataset(os.path.join(tc["samples_dir"], "train.jsonl"),
                                      tok, "train", max_len=tc["max_len"])
@@ -259,14 +283,16 @@ def main():
     model = GAMERModel(cfg).to(device)
     print(f"[INFO] 模型参数量: {model.num_parameters() / 1e6:.2f}M")
 
-    total_steps = steps_per_epoch * tc["epochs"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"],
                                   weight_decay=tc["weight_decay"])
-    scheduler = build_scheduler(optimizer, total_steps, tc["warmup_ratio"],
-                                tc["lr"], tc["min_lr"])
-    est = "（估算，stream 模式）" if tc["data_mode"] == "stream" else ""
-    print(f"[INFO] epochs={tc['epochs']}  steps/epoch={steps_per_epoch}{est}  "
-          f"总步数={total_steps}  有效batch={tc['batch_size'] * tc['grad_accum']}")
+    total_steps = steps_per_epoch * tc["epochs"] if steps_per_epoch else None
+    scheduler = build_scheduler(optimizer, tc["epochs"], tc["warmup_ratio"],
+                                tc["lr"], tc["min_lr"], total_steps=total_steps)
+    steps_desc = (f"steps/epoch={steps_per_epoch}  总步数={total_steps}"
+                  if steps_per_epoch else
+                  "steps/epoch=未知（epoch 1 实测后校准 lr 调度）")
+    print(f"[INFO] epochs={tc['epochs']}  {steps_desc}  "
+          f"有效batch={tc['batch_size'] * tc['grad_accum']}")
 
     os.makedirs(tc["output_dir"], exist_ok=True)
     slot_defs = build_slot_defs(tok, device)
@@ -313,6 +339,11 @@ def main():
                           f"loss={loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e}")
         if pending:                                  # epoch 末尾不足 grad_accum 的余量
             _optim_step()
+        if not scheduler.calibrated():               # stream：epoch 1 实测步数定调度
+            scheduler.calibrate(global_step)
+            print(f"[INFO] lr 调度校准: 实测 steps/epoch={global_step}  "
+                  f"总步数={global_step * tc['epochs']}  "
+                  f"warmup={max(int(global_step * tc['epochs'] * tc['warmup_ratio']), 1)}")
 
         train_loss = epoch_loss / max(epoch_tokens, 1)
         val_loss, per_slot = evaluate(model, val_dl, device, autocast_ctx, slot_defs)
