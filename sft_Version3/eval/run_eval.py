@@ -141,6 +141,8 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
                 if s["positives_by_action"].get(behavior)]
     acc, acc_pop = MetricAccumulator(ec["topk"]), MetricAccumulator(ec["topk"])
     n_labels = 0
+    infer_s = 0.0                       # 纯推理耗时（beam search 部分，含 GPU 同步）
+    n_batches = 0
     t0 = time.time()
     max_k = max(ec["topk"])
 
@@ -149,8 +151,11 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
             batch = eligible[lo: lo + ec["batch_size"]]
             prefixes = [make_prefix(tok, s["input"], behavior, ec["max_len"])
                         for s in batch]
+            t_inf = time.time()
             results = constrained_beam_search(model, tok, trie, prefixes,
                                               ec["beam_size"], device, autocast_ctx)
+            infer_s += time.time() - t_inf
+            n_batches += 1
             for s, beams in zip(batch, results):
                 labels = s["positives_by_action"][behavior]
                 ranked = [sid for sid, _ in beams]
@@ -167,7 +172,9 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
                 print(f"  [{behavior}] {done}/{len(eligible)} 用户 "
                       f"({time.time() - t0:.0f}s)")
     return {"model": acc.report(), "pop": acc_pop.report(),
-            "n": len(eligible), "avg_labels": n_labels / max(len(eligible), 1)}
+            "n": len(eligible), "avg_labels": n_labels / max(len(eligible), 1),
+            "infer_s": infer_s, "n_batches": n_batches,
+            "wall_s": time.time() - t0}
 
 
 def popularity_ranked(samples: list, behavior: str, k: int) -> list:
@@ -187,6 +194,12 @@ def print_report(behavior: str, r: dict, ks: list):
             m = rep.get(k, {"hr": 0, "recall": 0, "ndcg": 0})
             row += f"{m['hr']:>9.4f}{m['recall']:>10.4f}{m['ndcg']:>9.4f}"
         print(row)
+    if r["n"]:
+        avg_user_ms = r["infer_s"] / r["n"] * 1000
+        avg_batch_ms = r["infer_s"] / max(r["n_batches"], 1) * 1000
+        print(f"  推理耗时: 总计 {r['infer_s']:.1f}s（整段流程 {r['wall_s']:.1f}s）  "
+              f"平均 {avg_batch_ms:.0f}ms/batch  {avg_user_ms:.1f}ms/用户  "
+              f"吞吐 {r['n'] / max(r['infer_s'], 1e-9):.1f} 用户/s")
 
 
 # ------------------------------------------------------------------
