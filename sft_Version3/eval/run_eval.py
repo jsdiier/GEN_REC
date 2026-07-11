@@ -6,13 +6,12 @@ run_eval: 独立 test 窗口的端到端评测（GAMER 推理 -> HR/Recall/NDCG 
 流程：
   1. 读 common.conf：[data] test_start/test_end/test_sample_rate（test 集圈定），
      [eval] ckpt/topk/beam/batch（评测行为），[train] vocab_path/max_len；
-  2. 取数复用 step1->2->3 内存链（把窗口换成 test 窗口，max_num=-1 扫完整窗）：
-     每用户末 session 作 label、之前 sessions 作 input（留一法，与 val 同构）；
-     两道过滤保证可复现与无泄漏：
+  2. 取数复用 step1->2->3 内存链（把窗口换成 test 窗口）：直接取 step3 三分法
+     产出的 test 样本（input=S1..S(m-1), label=Sm；m>=3 的用户才有）。
+     三分法下最后一个 session 天然是 train/val 都没见过的，无需日期过滤，
+     test 窗口可以与训练窗口同天。用户抽样：
        - crc32(uid) % 10000 < test_sample_rate*10000（确定性抽样；test_max_num>0
-         时攒够即早停供小规模快测，-1 扫完整窗保证严格可复现）
-       - label_date 必须落在 [test_start, test_end] 内（末 session 停在训练窗口的
-         用户剔除——其 label 可能已被训练/验证阶段见过）；
+         时攒够即早停供小规模快测，-1 扫完整窗保证严格可复现）；
   3. 加载 ckpt（默认 best.pt）+ 用 item map 全量真实 item 建 SID 前缀树；
   4. 行为条件评测：对 clk / pay 各跑一遍——input 末尾强制接该行为 token，
      trie 约束 beam search 生成 top-K item，与 label session 中该行为的正样本
@@ -81,16 +80,14 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
     """扫完整个 test 窗口，返回 (samples, stats, id2sid)，id2sid 复用给 trie。
        sample: {uid, input: [(action, geo_sid)...], positives_by_action, label_date}。"""
     import step3_build_samples as step3
-    from step1_get_user_action import load_config, daterange
+    from step1_get_user_action import load_config
 
     cfg = load_config(conf_path)
     cfg["train_start"], cfg["train_end"] = ec["test_start"], ec["test_end"]
-    cfg["max_num"] = -1                       # 扫完整窗，保证 test 集与扫描顺序无关
+    cfg["max_num"] = -1                       # 上限由 test_max_num 控制
     cfg["behavior_drop_x"] = 0                # test 不需要 train 样本，关掉增强
     cfg["min_train_seq_len"] = 10 ** 9        # 让 build_train_sequences 直接返回空
 
-    allowed_dates = {f"{d[:4]}-{d[4:6]}-{d[6:]}"          # YYYYMMDD -> YYYY-MM-DD
-                     for d in daterange(ec["test_start"], ec["test_end"])}
     thresh = max(int(ec["test_sample_rate"] * 10000), 1)
 
     id2sid = step3.load_item_sid_map(step3.get_item_map_path(conf_path))
@@ -102,18 +99,15 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
         if zlib.crc32(str(uid).encode("utf-8")) % 10000 >= thresh:
             continue
         stats["uid_sampled"] += 1
-        val = next((s for s in user_samples if s["split"] == "val"), None)
-        if val is None:
-            stats["skip_lt2_sessions"] += 1   # session 数 < 2，留不出 label
-            continue
-        if val["label_date"] not in allowed_dates:
-            stats["skip_label_out_of_window"] += 1  # 末 session 停在训练窗口，防泄漏
+        test = next((s for s in user_samples if s["split"] == "test"), None)
+        if test is None:
+            stats["skip_lt3_sessions"] += 1   # m<3 出不了 test（m=2 归 val）
             continue
         samples.append({
-            "uid": val["uid"],
-            "input": step3._slim(val["input"]),
-            "positives_by_action": val["positives_by_action"],
-            "label_date": val["label_date"],
+            "uid": test["uid"],
+            "input": step3._slim(test["input"]),
+            "positives_by_action": test["positives_by_action"],
+            "label_date": test["label_date"],
         })
         if 0 < ec["test_max_num"] <= len(samples):
             stats["early_stopped"] = 1        # 小测早停：集合依赖扫描前缀
@@ -224,8 +218,7 @@ def main():
     samples, stats, id2sid = collect_test_samples(conf_path, ec)
     print(f"\n[INFO] test 集收集完成: 扫描 {stats['rows_scanned']} 行, "
           f"crc32 抽中 {stats['uid_sampled']}, "
-          f"剔除 <2 session {stats['skip_lt2_sessions']}, "
-          f"剔除 label 不在窗口 {stats['skip_label_out_of_window']}, "
+          f"剔除 <3 session {stats['skip_lt3_sessions']}, "
           f"最终 {stats['test_users']} 用户")
 
     # clk/pay 占比分布
