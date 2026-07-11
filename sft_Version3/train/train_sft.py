@@ -294,7 +294,22 @@ def main():
     print(f"[INFO] epochs={tc['epochs']}  {steps_desc}  "
           f"有效batch={tc['batch_size'] * tc['grad_accum']}")
 
-    os.makedirs(tc["output_dir"], exist_ok=True)
+    # 每次运行独立的 checkpoint 子目录（启动时间命名），重跑不覆盖；
+    # latest 软链指向最近一次运行，eval 默认读 latest/best.pt
+    run_stamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(tc["output_dir"], run_stamp)
+    os.makedirs(run_dir, exist_ok=True)
+    latest = os.path.join(tc["output_dir"], "latest")
+    if os.path.islink(latest):
+        os.remove(latest)
+    if not os.path.exists(latest):                 # 同名真目录存在则不动，只告警
+        os.symlink(run_stamp, latest)
+    else:
+        print(f"[WARN] {latest} 已存在且不是软链，跳过更新")
+    if not tc["wandb_run_name"]:                   # wandb run 名与目录共用时间戳，便于对应
+        tc["wandb_run_name"] = f"gamer-{tc['data_mode']}-{run_stamp}"
+    print(f"[INFO] checkpoint 目录: {run_dir}  （latest -> {run_stamp}）")
+
     slot_defs = build_slot_defs(tok, device)
     wb = init_wandb(tc, cfg)
     best_val, best_epoch, bad_epochs = float("inf"), -1, 0
@@ -350,12 +365,12 @@ def main():
         mark = ""
         if val_loss < best_val:
             best_val, best_epoch, bad_epochs = val_loss, epoch, 0
-            save_checkpoint(os.path.join(tc["output_dir"], "best.pt"),
+            save_checkpoint(os.path.join(run_dir, "best.pt"),
                             model, cfg, epoch, val_loss)
             mark = "  <- best"
         else:
             bad_epochs += 1
-        save_checkpoint(os.path.join(tc["output_dir"], "last.pt"),
+        save_checkpoint(os.path.join(run_dir, "last.pt"),
                         model, cfg, epoch, val_loss)
         if wb:
             log = {"train/epoch_loss": train_loss, "val/loss": val_loss,
@@ -379,7 +394,7 @@ def main():
         wb.summary["best_epoch"] = best_epoch
         wb.finish()
     print(f"\n[DONE] best val_loss={best_val:.4f} @ epoch {best_epoch}  "
-          f"checkpoint: {tc['output_dir']}/best.pt")
+          f"checkpoint: {run_dir}/best.pt")
 
 
 if __name__ == "__main__":
