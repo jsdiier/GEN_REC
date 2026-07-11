@@ -12,8 +12,10 @@ train_sft: GAMER 从零训练循环（对齐论文 4.1.4 的训练配置）。
                lr 调度总步数 epoch 1 结束后按实测步数自动校准（见 build_scheduler）；
   3. GAMERModel（配置由 tokenizer 推导：vocab_size / tokens_per_item / behavior_levels）；
   4. AdamW + 线性 warmup(4%) + 余弦衰减到 min_lr；
-  5. 逐 epoch：train 全 token 监督 NTP；epoch 末跑 val（teacher-forcing，只算 label 区，
-     按有效 token 数加权聚合）；val loss 创新低则存 best.pt，每个 epoch 更新 last.pt；
+  5. 逐 epoch：train 全 token 监督 NTP；val（teacher-forcing，只算 label 区，按有效
+     token 数加权聚合）在每个 epoch 末必跑，eval_every>0 时每隔该步数再加跑一次
+     （全量数据单 epoch 很长，epoch 末一次太稀）；val loss 创新低即存 best.pt，
+     每个 epoch 末更新 last.pt；
   6. patience>0 时按 val loss 早停；否则训满 epochs（论文做法，最终用 best.pt）。
 
 说明：
@@ -76,6 +78,7 @@ def load_train_config(conf_path: str) -> dict:
         "seed": cp.getint("train", "seed", fallback=42),
         "num_workers": cp.getint("train", "num_workers", fallback=2),
         "log_every": cp.getint("train", "log_every", fallback=50),
+        "eval_every": cp.getint("train", "eval_every", fallback=0),
         "wandb_project": cp.get("train", "wandb_project", fallback="").strip(),
         "wandb_run_name": cp.get("train", "wandb_run_name", fallback="").strip(),
     }
@@ -316,8 +319,30 @@ def main():
     global_step = 0
     model.train()
 
+    def _run_val(tag: str) -> float:
+        """跑一遍完整 val（同一批常驻内存样本）并打印/上报 wandb；
+           创新低即存 best.pt。返回本次 val loss。"""
+        nonlocal best_val, best_epoch
+        vl, per_slot = evaluate(model, val_dl, device, autocast_ctx, slot_defs)
+        improved = vl < best_val
+        if improved:
+            best_val, best_epoch = vl, epoch
+            save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, epoch, vl)
+        if wb:
+            log = {"val/loss": vl, "val/best_loss": best_val, "epoch": epoch}
+            for name, (sl, sm) in per_slot.items():
+                log[f"val/loss_{name}"] = sl
+                log[f"val/mass_{name}"] = sm
+            wb.log(log, step=global_step)
+        slot_str = "  ".join(f"{n} {sl:.2f}/{sm:.2f}"
+                             for n, (sl, sm) in per_slot.items())
+        print(f"{tag} val_loss={vl:.4f}{'  <- best' if improved else ''}")
+        print(f"  分位 loss/mass: {slot_str}")
+        return vl
+
     for epoch in range(1, tc["epochs"] + 1):
         t0 = time.time()
+        best_before = best_val                       # patience 按「整个 epoch 有无创新低」算
         if hasattr(train_ds, "set_epoch"):
             train_ds.set_epoch(epoch)      # stream 模式：洗牌顺序随 epoch 变化
         epoch_loss, epoch_tokens = 0.0, 0
@@ -352,6 +377,8 @@ def main():
                 if global_step % tc["log_every"] == 0:
                     print(f"  epoch {epoch} step {global_step} "
                           f"loss={loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e}")
+                if tc["eval_every"] > 0 and global_step % tc["eval_every"] == 0:
+                    _run_val(f"  [VAL@step {global_step}]")
         if pending:                                  # epoch 末尾不足 grad_accum 的余量
             _optim_step()
         if not scheduler.calibrated():               # stream：epoch 1 实测步数定调度
@@ -361,29 +388,14 @@ def main():
                   f"warmup={max(int(global_step * tc['epochs'] * tc['warmup_ratio']), 1)}")
 
         train_loss = epoch_loss / max(epoch_tokens, 1)
-        val_loss, per_slot = evaluate(model, val_dl, device, autocast_ctx, slot_defs)
-        mark = ""
-        if val_loss < best_val:
-            best_val, best_epoch, bad_epochs = val_loss, epoch, 0
-            save_checkpoint(os.path.join(run_dir, "best.pt"),
-                            model, cfg, epoch, val_loss)
-            mark = "  <- best"
-        else:
-            bad_epochs += 1
+        val_loss = _run_val(f"[EPOCH {epoch}/{tc['epochs']}] "
+                            f"train_loss={train_loss:.4f} ({time.time() - t0:.1f}s)")
+        bad_epochs = 0 if best_val < best_before else bad_epochs + 1
         save_checkpoint(os.path.join(run_dir, "last.pt"),
                         model, cfg, epoch, val_loss)
         if wb:
-            log = {"train/epoch_loss": train_loss, "val/loss": val_loss,
-                   "val/best_loss": best_val, "epoch": epoch}
-            for name, (sl, sm) in per_slot.items():
-                log[f"val/loss_{name}"] = sl
-                log[f"val/mass_{name}"] = sm
-            wb.log(log, step=global_step)
-        slot_str = "  ".join(f"{n} {sl:.2f}/{sm:.2f}"
-                             for n, (sl, sm) in per_slot.items())
-        print(f"[EPOCH {epoch}/{tc['epochs']}] train_loss={train_loss:.4f} "
-              f"val_loss={val_loss:.4f} ({time.time() - t0:.1f}s){mark}")
-        print(f"  分位 loss/mass: {slot_str}")
+            wb.log({"train/epoch_loss": train_loss, "epoch": epoch},
+                   step=global_step)
 
         if tc["patience"] > 0 and bad_epochs >= tc["patience"]:
             print(f"[INFO] val loss 连续 {tc['patience']} 个 epoch 无改善，早停")
