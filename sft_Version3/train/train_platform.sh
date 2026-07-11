@@ -20,8 +20,8 @@ ENV_PATH="${DATA_PREFIX}/chenpinyuan/miniconda_base/envs/SFT_A6000"
 export PATH="${ENV_PATH}/bin:$PATH"
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-# 如需 wandb 监控：容器内没有 ~/.netrc，在平台侧安全注入 WANDB_API_KEY；
-# 不注入则训练自动降级为跳过监控，不报错。
+# wandb：key 从 conf 的 [train] wandb_api_key 读取（train_sft.py 内导出），
+# 容器无需 ~/.netrc；conf 留空且容器无凭证时自动降级为跳过监控。
 echo ">>> 当前 Python 路径: $(which python)"
 python --version
 if [ -x "/usr/local/hadoop-current/bin/hadoop" ]; then

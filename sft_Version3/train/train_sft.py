@@ -81,6 +81,7 @@ def load_train_config(conf_path: str) -> dict:
         "eval_every": cp.getint("train", "eval_every", fallback=0),
         "wandb_project": cp.get("train", "wandb_project", fallback="").strip(),
         "wandb_run_name": cp.get("train", "wandb_run_name", fallback="").strip(),
+        "wandb_api_key": cp.get("train", "wandb_api_key", fallback="").strip(),
         "resume_from": (lambda v: "" if not v else path("resume_from", v))(
             cp.get("train", "resume_from", fallback="").strip()),
     }
@@ -88,9 +89,12 @@ def load_train_config(conf_path: str) -> dict:
 
 def init_wandb(tc: dict, model_cfg) -> "object":
     """wandb_project 配置了才开启；wandb 未安装或未登录时降级为警告，不阻塞训练。
-       API key 从环境读（wandb login / WANDB_API_KEY），不进配置文件。"""
+       API key 优先读 conf 的 wandb_api_key（本地/平台容器通用），
+       留空则回退 WANDB_API_KEY 环境变量 / ~/.netrc（wandb login）。"""
     if not tc["wandb_project"]:
         return None
+    if tc["wandb_api_key"]:
+        os.environ["WANDB_API_KEY"] = tc["wandb_api_key"]
     try:
         import wandb
     except ImportError:
