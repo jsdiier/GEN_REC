@@ -7,6 +7,8 @@ set -o pipefail
 
 # ==== 环境初始化（与 infer_Version2.sh 同款：NFS/本地双挂载名自适应）========
 echo ">>> 正在初始化环境..."
+# 带出镜像里的 JAVA_HOME 等（hadoop 客户端需要；参考 tf_rank 项目的平台脚本）
+source /etc/profile || true
 if [ -d "/nfs/dataset-ofs-rank-ssl" ]; then
     DATA_PREFIX="/nfs/dataset-ofs-rank-ssl"
     echo ">>> 检测到训练平台环境 NFS，使用路径: ${DATA_PREFIX}"
@@ -22,6 +24,12 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 # 不注入则训练自动降级为跳过监控，不报错。
 echo ">>> 当前 Python 路径: $(which python)"
 python --version
+if [ -x "/usr/local/hadoop-current/bin/hadoop" ]; then
+    echo ">>> hadoop 客户端可用: /usr/local/hadoop-current/bin/hadoop"
+else
+    echo ">>> [WARN] 容器内没有 hadoop 客户端！stream 模式取数会失败——"
+    echo ">>>        检查 [platform] image_uuid 是否为带 hadoop 的训练镜像"
+fi
 nvidia-smi || true
 # ============================================================================
 
