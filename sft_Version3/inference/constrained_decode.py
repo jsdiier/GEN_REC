@@ -29,6 +29,21 @@ import torch
 import torch.nn.functional as F
 
 
+def make_prefix(tok, items: list, behavior: str, max_len: int) -> dict:
+    """[BOS] + 历史交互（按交互粒度左截断）+ 强制行为 token。
+       预留 num_levels 个生成位，保证总长 <= max_len。
+       eval（input=S1..S(m-1)）与 inference（全部历史）共用。"""
+    stride = 1 + tok.num_levels
+    keep = max((max_len - 2 - tok.num_levels) // stride, 1)
+    ids, beh, types = tok.encode_items(items[-keep:])
+    b = tok.behavior2id[behavior]
+    return {
+        "input_ids": [tok.bos_id] + ids + [tok.token2id[f"<{behavior}>"]],
+        "behavior_ids": [-1] + beh + [b],
+        "token_types": [-1] + types + [0],
+    }
+
+
 def build_sid_trie(tokenizer, geo_sids) -> dict:
     """全部真实 item 的 geo_sid 字符串 -> token id 前缀树（嵌套 dict，叶子为空 dict）。
        编码失败的 sid（层数异常/词表外 token）跳过并计数告警。"""

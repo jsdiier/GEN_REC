@@ -40,7 +40,8 @@ for p in ("train", os.path.join("train", "model"), "data", "inference", "eval"):
 
 from tokenizer_sid import SIDTokenizer                     # noqa: E402
 from train_sft import load_checkpoint                      # noqa: E402
-from constrained_decode import build_sid_trie, constrained_beam_search  # noqa: E402
+from constrained_decode import (build_sid_trie, constrained_beam_search,  # noqa: E402
+                                make_prefix)
 from metrics import rank_metrics, MetricAccumulator        # noqa: E402
 
 
@@ -119,20 +120,6 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
 # ------------------------------------------------------------------
 # 行为条件评测
 # ------------------------------------------------------------------
-def make_prefix(tok, items: list, behavior: str, max_len: int) -> dict:
-    """[BOS] + 历史交互（按交互粒度左截断）+ 强制行为 token。
-       预留 num_levels 个生成位，保证总长 <= max_len。"""
-    stride = 1 + tok.num_levels
-    keep = max((max_len - 2 - tok.num_levels) // stride, 1)
-    ids, beh, types = tok.encode_items(items[-keep:])
-    b = tok.behavior2id[behavior]
-    return {
-        "input_ids": [tok.bos_id] + ids + [tok.token2id[f"<{behavior}>"]],
-        "behavior_ids": [-1] + beh + [b],
-        "token_types": [-1] + types + [0],
-    }
-
-
 def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
                   device, autocast_ctx, pop_ranked: list, pred_path: str) -> dict:
     """对 label 里含该行为的用户跑约束 beam search 并累计指标。
