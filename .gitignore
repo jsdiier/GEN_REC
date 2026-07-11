@@ -1,0 +1,8 @@
+**/outputs/**
+!**/outputs/**/.gitkeep
+**/logs/*
+!**/logs/.gitkeep
+__pycache__/
+*.pyc
+common.platform.conf
+wandb/
