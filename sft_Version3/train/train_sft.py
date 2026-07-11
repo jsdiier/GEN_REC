@@ -81,6 +81,8 @@ def load_train_config(conf_path: str) -> dict:
         "eval_every": cp.getint("train", "eval_every", fallback=0),
         "wandb_project": cp.get("train", "wandb_project", fallback="").strip(),
         "wandb_run_name": cp.get("train", "wandb_run_name", fallback="").strip(),
+        "resume_from": (lambda v: "" if not v else path("resume_from", v))(
+            cp.get("train", "resume_from", fallback="").strip()),
     }
 
 
@@ -143,6 +145,8 @@ def build_scheduler(optimizer, epochs: int, warmup_ratio: float,
     sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     sched.calibrate = calibrate
     sched.calibrated = lambda: state["total"] is not None
+    sched.export_state = lambda: dict(state)       # 断点续训：校准状态随 last.pt 存取
+    sched.import_state = state.update
     if total_steps is not None:
         state["total"] = total_steps
         state["warmup"] = max(int(total_steps * warmup_ratio), 1)
@@ -202,13 +206,19 @@ def evaluate(model, val_dl, device, autocast_ctx, slot_defs=None):
     return total_loss / max(total_tokens, 1), per_slot
 
 
-def save_checkpoint(path: str, model, cfg: GAMERConfig, epoch: int, val_loss: float):
-    torch.save({
+def save_checkpoint(path: str, model, cfg: GAMERConfig, epoch: int, val_loss: float,
+                    extra: dict = None):
+    """best.pt 只存权重（推理用，体积小）；last.pt 由调用方传 extra
+       （optimizer/scheduler/global_step 等）支持断点续训。"""
+    d = {
         "model": model.state_dict(),
         "config": asdict(cfg),
         "epoch": epoch,
         "val_loss": val_loss,
-    }, path)
+    }
+    if extra:
+        d.update(extra)
+    torch.save(d, path)
 
 
 def load_checkpoint(path: str, map_location="cpu"):
@@ -297,26 +307,58 @@ def main():
     print(f"[INFO] epochs={tc['epochs']}  {steps_desc}  "
           f"有效batch={tc['batch_size'] * tc['grad_accum']}")
 
-    # 每次运行独立的 checkpoint 子目录（启动时间命名），重跑不覆盖；
-    # latest 软链指向最近一次运行，eval 默认读 latest/best.pt
-    run_stamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(tc["output_dir"], run_stamp)
-    os.makedirs(run_dir, exist_ok=True)
-    latest = os.path.join(tc["output_dir"], "latest")
-    if os.path.islink(latest):
-        os.remove(latest)
-    if not os.path.exists(latest):                 # 同名真目录存在则不动，只告警
-        os.symlink(run_stamp, latest)
+    # ---- 断点续训（[train] resume_from = run 目录或 last.pt 路径；留空 = 全新训练）----
+    start_epoch, resume_dir = 1, None
+    best_val, best_epoch, bad_epochs = float("inf"), -1, 0
+    global_step = 0
+    if tc["resume_from"]:
+        ckpt_file = tc["resume_from"]
+        if not ckpt_file.endswith(".pt"):
+            ckpt_file = os.path.join(ckpt_file, "last.pt")
+        ck = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        model.load_state_dict(ck["model"])
+        start_epoch = ck["epoch"] + 1
+        best_val = ck.get("best_val", ck["val_loss"])
+        best_epoch = ck.get("best_epoch", ck["epoch"])
+        if "optimizer" in ck:                      # 新格式：optimizer/调度器完整恢复
+            optimizer.load_state_dict(ck["optimizer"])
+            scheduler.last_epoch = ck["sched_last_epoch"]   # LambdaLR 的位置即全部状态
+            scheduler.import_state(ck["sched_calib"])
+            global_step = ck["global_step"]
+        else:                                      # 旧格式（只有权重）：动量冷启动，
+            print("[WARN] checkpoint 无 optimizer/调度器状态（旧格式）：动量冷启动；"
+                  "lr 在首个续训 epoch 走峰值平顶，epoch 末校准并快进到真实进度")
+        resume_dir = os.path.dirname(os.path.abspath(ckpt_file))
+        print(f"[INFO] 断点续训: {ckpt_file}  从 epoch {start_epoch}/{tc['epochs']} 继续"
+              f"（已有 best_val={best_val:.4f} @ epoch {best_epoch}）")
+        if start_epoch > tc["epochs"]:
+            print(f"[WARN] 已训满 epochs={tc['epochs']}，无事可做")
+            return
+
+    # checkpoint 目录：全新训练建「启动时间」子目录，续训沿用原目录；
+    # latest 软链指向本次写入的目录，eval 默认读 latest/best.pt
+    if resume_dir:
+        run_dir = resume_dir
+        run_stamp = os.path.basename(run_dir.rstrip("/"))
     else:
-        print(f"[WARN] {latest} 已存在且不是软链，跳过更新")
+        run_stamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(tc["output_dir"], run_stamp)
+        os.makedirs(run_dir, exist_ok=True)
+    if os.path.dirname(os.path.abspath(run_dir)) == os.path.abspath(tc["output_dir"]):
+        latest = os.path.join(tc["output_dir"], "latest")
+        if os.path.islink(latest):
+            os.remove(latest)
+        if not os.path.exists(latest):             # 同名真目录存在则不动，只告警
+            os.symlink(run_stamp, latest)
+        else:
+            print(f"[WARN] {latest} 已存在且不是软链，跳过更新")
     if not tc["wandb_run_name"]:                   # wandb run 名与目录共用时间戳，便于对应
-        tc["wandb_run_name"] = f"gamer-{tc['data_mode']}-{run_stamp}"
+        suffix = f"-r{start_epoch}" if resume_dir else ""
+        tc["wandb_run_name"] = f"gamer-{tc['data_mode']}-{run_stamp}{suffix}"
     print(f"[INFO] checkpoint 目录: {run_dir}  （latest -> {run_stamp}）")
 
     slot_defs = build_slot_defs(tok, device)
     wb = init_wandb(tc, cfg)
-    best_val, best_epoch, bad_epochs = float("inf"), -1, 0
-    global_step = 0
     model.train()
 
     def _run_val(tag: str) -> float:
@@ -340,9 +382,10 @@ def main():
         print(f"  分位 loss/mass: {slot_str}")
         return vl
 
-    for epoch in range(1, tc["epochs"] + 1):
+    for epoch in range(start_epoch, tc["epochs"] + 1):
         t0 = time.time()
         best_before = best_val                       # patience 按「整个 epoch 有无创新低」算
+        epoch_start_step = global_step
         if hasattr(train_ds, "set_epoch"):
             train_ds.set_epoch(epoch)      # stream 模式：洗牌顺序随 epoch 变化
         epoch_loss, epoch_tokens = 0.0, 0
@@ -381,18 +424,28 @@ def main():
                     _run_val(f"  [VAL@step {global_step}]")
         if pending:                                  # epoch 末尾不足 grad_accum 的余量
             _optim_step()
-        if not scheduler.calibrated():               # stream：epoch 1 实测步数定调度
-            scheduler.calibrate(global_step)
-            print(f"[INFO] lr 调度校准: 实测 steps/epoch={global_step}  "
-                  f"总步数={global_step * tc['epochs']}  "
-                  f"warmup={max(int(global_step * tc['epochs'] * tc['warmup_ratio']), 1)}")
+        if not scheduler.calibrated():               # stream：首个完整 epoch 实测步数定调度
+            steps_this = global_step - epoch_start_step
+            scheduler.calibrate(steps_this)
+            if epoch > 1:                            # 旧格式续训：快进调度器到真实进度
+                scheduler.last_epoch = steps_this * epoch
+                global_step = steps_this * epoch
+                print(f"[INFO] 调度器快进到 step {global_step}（补齐续训前的 {epoch - 1} 个 epoch）")
+            print(f"[INFO] lr 调度校准: 实测 steps/epoch={steps_this}  "
+                  f"总步数={steps_this * tc['epochs']}  "
+                  f"warmup={max(int(steps_this * tc['epochs'] * tc['warmup_ratio']), 1)}")
 
         train_loss = epoch_loss / max(epoch_tokens, 1)
         val_loss = _run_val(f"[EPOCH {epoch}/{tc['epochs']}] "
                             f"train_loss={train_loss:.4f} ({time.time() - t0:.1f}s)")
         bad_epochs = 0 if best_val < best_before else bad_epochs + 1
         save_checkpoint(os.path.join(run_dir, "last.pt"),
-                        model, cfg, epoch, val_loss)
+                        model, cfg, epoch, val_loss,
+                        extra={"optimizer": optimizer.state_dict(),
+                               "sched_last_epoch": scheduler.last_epoch,
+                               "sched_calib": scheduler.export_state(),
+                               "global_step": global_step,
+                               "best_val": best_val, "best_epoch": best_epoch})
         if wb:
             wb.log({"train/epoch_loss": train_loss, "epoch": epoch},
                    step=global_step)
