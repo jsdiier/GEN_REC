@@ -35,6 +35,55 @@ def rank_metrics(ranked: list, labels, ks: list) -> dict:
     return out
 
 
+def _sid_parts(sid: str) -> list:
+    """'<g><a_1><b_2>...' -> ['g', 'a_1', 'b_2', ...]"""
+    return sid[1:-1].split("><")
+
+
+def prefix_hr(ranked: list, labels, ks: list, num_levels: int) -> dict:
+    """分层前缀命中（方向诊断）：depth j 命中 = top-K 内存在与任一 label 的
+       前 j 层 SID 完全一致的预测。depth=num_levels 即精确命中（等于 HR@K）。
+       返回 {depth: {K: 0/1}}。"""
+    max_k = max(ks)
+    label_pfx = [set() for _ in range(num_levels)]
+    for sid in labels:
+        parts = _sid_parts(sid)
+        for j in range(num_levels):
+            label_pfx[j].add(tuple(parts[:j + 1]))
+    # hit_at[j] = 最早命中 depth j+1 的名次（1-indexed），未命中为 None
+    hit_at = [None] * num_levels
+    for pos, sid in enumerate(ranked[:max_k], start=1):
+        parts = _sid_parts(sid)
+        for j in range(num_levels):
+            if hit_at[j] is None and tuple(parts[:j + 1]) in label_pfx[j]:
+                hit_at[j] = pos
+    return {j + 1: {k: (1.0 if hit_at[j] is not None and hit_at[j] <= k else 0.0)
+                    for k in ks}
+            for j in range(num_levels)}
+
+
+class PrefixHRAccumulator:
+    """逐用户累加分层前缀命中，report() 给平均。"""
+
+    def __init__(self, ks: list, num_levels: int):
+        self.ks = ks
+        self.num_levels = num_levels
+        self.n = 0
+        self.sums = {j: {k: 0.0 for k in ks} for j in range(1, num_levels + 1)}
+
+    def add(self, per: dict):
+        self.n += 1
+        for j, d in per.items():
+            for k, v in d.items():
+                self.sums[j][k] += v
+
+    def report(self) -> dict:
+        if self.n == 0:
+            return {}
+        return {j: {k: v / self.n for k, v in d.items()}
+                for j, d in self.sums.items()}
+
+
 class MetricAccumulator:
     """逐用户累加，report() 给平均。"""
 

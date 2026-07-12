@@ -42,7 +42,25 @@ from tokenizer_sid import SIDTokenizer                     # noqa: E402
 from train_sft import load_checkpoint                      # noqa: E402
 from constrained_decode import (build_sid_trie, constrained_beam_search,  # noqa: E402
                                 make_prefix)
-from metrics import rank_metrics, MetricAccumulator        # noqa: E402
+from metrics import (rank_metrics, MetricAccumulator,      # noqa: E402
+                     prefix_hr, PrefixHRAccumulator, _sid_parts)
+
+try:
+    from tabulate import tabulate
+except ImportError:                                        # 未安装时降级为简易对齐
+    tabulate = None
+
+
+def _render_table(rows: list, headers: list) -> str:
+    if tabulate:
+        return tabulate(rows, headers=headers, tablefmt="github",
+                        stralign="right", numalign="right")
+    widths = [max(len(str(x)) for x in [h] + [r[i] for r in rows])
+              for i, h in enumerate(headers)]
+    def line(cells):
+        return "  ".join(str(c).rjust(w) for c, w in zip(cells, widths))
+    return "\n".join([line(headers), line(["-" * w for w in widths])] +
+                     [line(r) for r in rows])
 
 
 # ------------------------------------------------------------------
@@ -127,6 +145,8 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
     eligible = [s for s in samples
                 if s["positives_by_action"].get(behavior)]
     acc, acc_pop = MetricAccumulator(ec["topk"]), MetricAccumulator(ec["topk"])
+    L = tok.num_levels
+    pfx, pfx_pop = PrefixHRAccumulator(ec["topk"], L), PrefixHRAccumulator(ec["topk"], L)
     n_labels = 0
     infer_s = 0.0                       # 纯推理耗时（beam search 部分，含 GPU 同步）
     n_batches = 0
@@ -148,6 +168,8 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
                 ranked = [sid for sid, _ in beams]
                 acc.add(rank_metrics(ranked, labels, ec["topk"]))
                 acc_pop.add(rank_metrics(pop_ranked, labels, ec["topk"]))
+                pfx.add(prefix_hr(ranked, labels, ec["topk"], L))
+                pfx_pop.add(prefix_hr(pop_ranked, labels, ec["topk"], L))
                 n_labels += len(labels)
                 fout.write(json.dumps({
                     "uid": s["uid"], "behavior": behavior,
@@ -159,6 +181,7 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
                 print(f"  [{behavior}] {done}/{len(eligible)} 用户 "
                       f"({time.time() - t0:.0f}s)")
     return {"model": acc.report(), "pop": acc_pop.report(),
+            "prefix_model": pfx.report(), "prefix_pop": pfx_pop.report(),
             "n": len(eligible), "avg_labels": n_labels / max(len(eligible), 1),
             "infer_s": infer_s, "n_batches": n_batches,
             "wall_s": time.time() - t0}
@@ -170,17 +193,28 @@ def popularity_ranked(samples: list, behavior: str, k: int) -> list:
     return [sid for sid, _ in cnt.most_common(k)]
 
 
-def print_report(behavior: str, r: dict, ks: list):
+def print_report(behavior: str, r: dict, ks: list, level_tags: list):
     print(f"\n---- {behavior} （{r['n']} 用户，平均正样本 {r['avg_labels']:.2f}）----")
-    head = f"  {'':>10}" + "".join(f"{'HR@' + str(k):>9}{'Recall@' + str(k):>10}"
-                                   f"{'NDCG@' + str(k):>9}" for k in ks)
-    print(head)
+    headers = ["模型"] + [f"{m}@{k}" for k in ks for m in ("HR", "Recall", "NDCG")]
+    rows = []
     for name, rep in (("GAMER", r["model"]), ("热门基线", r["pop"])):
-        row = f"  {name:>8}"
-        for k in ks:
-            m = rep.get(k, {"hr": 0, "recall": 0, "ndcg": 0})
-            row += f"{m['hr']:>9.4f}{m['recall']:>10.4f}{m['ndcg']:>9.4f}"
-        print(row)
+        rows.append([name] + [f"{rep.get(k, {}).get(key, 0.0):.4f}"
+                              for k in ks for key in ("hr", "recall", "ndcg")])
+    print(_render_table(rows, headers))
+
+    # 分层前缀命中率：depth j = 预测的前 j 层 SID 与任一 label 前 j 层一致
+    # （L1 对 = 地方对了，逐层收窄；最深层 = 精确命中，应等于上表 HR）
+    print(f"\n  分层前缀命中率 HR@K（GAMER / 热门基线）:")
+    headers2 = ["前缀深度"] + [f"@{k}" for k in ks]
+    rows2 = []
+    for j in range(1, len(level_tags) + 1):
+        name = f"L{j}(" + "+".join(level_tags[:j]) + ")"
+        if len(name) > 14:
+            name = f"L{j}(..+{level_tags[j - 1]})"
+        rows2.append([name] + [
+            f"{r['prefix_model'].get(j, {}).get(k, 0.0):.4f} / "
+            f"{r['prefix_pop'].get(j, {}).get(k, 0.0):.4f}" for k in ks])
+    print(_render_table(rows2, headers2))
     if r["n"]:
         avg_user_ms = r["infer_s"] / r["n"] * 1000
         avg_batch_ms = r["infer_s"] / max(r["n_batches"], 1) * 1000
@@ -232,6 +266,8 @@ def main():
 
     trie = build_sid_trie(tok, id2sid.values())
     print(f"[INFO] SID trie 构建完成（覆盖 {len(set(id2sid.values()))} 个真实 item）")
+    sample_parts = _sid_parts(next(iter(id2sid.values())))
+    level_tags = ["geo"] + [p.split("_")[0] for p in sample_parts[1:]]
 
     os.makedirs(ec["predictions_out_dir"], exist_ok=True)
     reports = {}
@@ -244,7 +280,7 @@ def main():
 
     print("\n================ 评测报表 ================")
     for behavior in tok.behaviors:
-        print_report(behavior, reports[behavior], ec["topk"])
+        print_report(behavior, reports[behavior], ec["topk"], level_tags)
     print("\n（HR=top-K 命中任一正样本；Recall=命中数/正样本数；NDCG 按命中位置加权。"
           "热门基线 = test 用户 input 区该行为 item 频次 top-K，模型显著高于它才说明学到了个性化）")
     print("==========================================")
