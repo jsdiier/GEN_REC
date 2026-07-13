@@ -15,8 +15,9 @@ generate: 批量推理（纯产出推荐结果，无 label、不算指标）。
      与 [train]（vocab_path/max_len）；
   2. 加载 ckpt + item map 建 SID 前缀树与 sid->item_ids 反查表；
   3. 流式拉窗口数据（复用 step1->2 + step3 的时间线/session 工具），逐用户拼
-     全历史前缀，按 conf 配置的每个行为强制接行为 token，trie 约束 beam search
-     生成 top-K item；
+     全历史前缀，按 conf 配置的每个 (行为 x 时段) 组合强制接 <时段><行为> token
+     （词表无时段位时仅行为），trie 约束 beam search 生成 top-K item，
+     输出 rec_{行为}_{时段}.parquet；
   4. 边收边推边写（不整窗攒内存）：结果存 parquet（比 jsonl 省一个量级存储），
      目录按推理窗口命名：{output_dir}/{infer_start}_{infer_end}/rec_{behavior}.parquet，
      行 = 一条推荐（uid, rank, sid, score, item_ids），每用户每行为 topk 行；
@@ -70,6 +71,9 @@ def load_infer_config(conf_path: str) -> dict:
         "behaviors": [b.strip() for b in
                       cp.get("inference", "behaviors", fallback="clk,pay").split(",")
                       if b.strip()],
+        "periods": [p.strip() for p in
+                    cp.get("inference", "periods", fallback="").split(",")
+                    if p.strip()],
         "topk": topk,
         "beam_size": max(cp.getint("inference", "beam_size", fallback=topk), topk),
         "batch_size": cp.getint("inference", "batch_size", fallback=32),
@@ -99,7 +103,8 @@ def iter_infer_users(conf_path: str, ic: dict, id2sid: dict):
     n = 0
     for uid, sessions, _samples in step3.iter_user_samples(
             cfg, conf_path, id2sid=id2sid, verbose=True):
-        items = [(t["action"], t["geo_sid"]) for _, toks in sessions for t in toks]
+        items = [(t["action"], t["geo_sid"], t["meal_period"])
+                 for _, toks in sessions for t in toks]
         if not items:
             continue                          # 清洗后没有任何可用交互
         yield uid, items
@@ -154,21 +159,24 @@ class ParquetRecWriter:
 # ------------------------------------------------------------------
 def generate_for_users(model, tok, trie, user_iter, ic: dict,
                        device, autocast_ctx, writers: dict) -> dict:
-    """按 batch 收用户 -> 每个行为各跑一次约束 beam search -> 逐用户写 writer。
-       返回 {behavior: {"n": 用户数, "infer_s": 纯推理秒}}。"""
-    stats = {b: {"n": 0, "infer_s": 0.0} for b in ic["behaviors"]}
+    """按 batch 收用户 -> 每个 (行为[, 时段]) 组各跑一次约束 beam search ->
+       逐用户写对应 writer。writers/返回值均以组名（如 'pay_bf'）为键：
+       {组名: {"n": 用户数, "infer_s": 纯推理秒}}。"""
+    groups = ic["groups"]                 # [(组名, behavior, period)]
+    stats = {g: {"n": 0, "infer_s": 0.0} for g, _, _ in groups}
 
     def flush(batch):
-        for behavior in ic["behaviors"]:
-            prefixes = [make_prefix(tok, items, behavior, ic["max_len"])
+        for gname, behavior, period in groups:
+            prefixes = [make_prefix(tok, items, behavior, ic["max_len"],
+                                    period=period)
                         for _, items in batch]
             t0 = time.time()
             results = constrained_beam_search(model, tok, trie, prefixes,
                                               ic["beam_size"], device, autocast_ctx)
-            stats[behavior]["infer_s"] += time.time() - t0
-            stats[behavior]["n"] += len(batch)
+            stats[gname]["infer_s"] += time.time() - t0
+            stats[gname]["n"] += len(batch)
             for (uid, _), beams in zip(batch, results):
-                writers[behavior].write_user(uid, beams)
+                writers[gname].write_user(uid, beams)
 
     batch, done = [], 0
     for uid, items in user_iter:
@@ -199,13 +207,26 @@ def main():
     max_desc = "全量窗口" if ic["infer_max_num"] == -1 else f"前 {ic['infer_max_num']} 个可推用户"
     print(f"[INFO] device={device}")
     print(f"[INFO] 推理窗口: {ic['infer_start']} ~ {ic['infer_end']}  取 {max_desc}")
-    print(f"[INFO] behaviors={ic['behaviors']}  topk={ic['topk']}  "
-          f"beam={ic['beam_size']}  batch={ic['batch_size']}")
 
     tok = SIDTokenizer.load(ic["vocab_path"])
     for b in ic["behaviors"]:
         if b not in tok.behaviors:
             raise ValueError(f"未知行为 {b!r}（词表行为: {tok.behaviors}）")
+    tok_periods = list(getattr(tok, "periods", []))
+    if tok_periods:                       # 词表含时段位：条件必须给全
+        periods = ic["periods"] or tok_periods
+        for p in periods:
+            if p not in tok_periods:
+                raise ValueError(f"未知时段 {p!r}（词表时段: {tok_periods}）")
+    else:
+        if ic["periods"]:
+            raise ValueError("词表不含时段位，[inference] periods 应留空")
+        periods = [None]
+    # (组名, behavior, period)；无时段位时组名 = 行为名
+    ic["groups"] = [(b if p is None else f"{b}_{p}", b, p)
+                    for b in ic["behaviors"] for p in periods]
+    print(f"[INFO] 生成组合={[g for g, _, _ in ic['groups']]}  topk={ic['topk']}  "
+          f"beam={ic['beam_size']}  batch={ic['batch_size']}")
     model, _cfg, meta = load_checkpoint(ic["ckpt_path"], map_location=device)
     model.to(device).eval()
     print(f"[INFO] ckpt={ic['ckpt_path']}  (epoch={meta['epoch']} "
@@ -221,9 +242,10 @@ def main():
 
     run_dir = os.path.join(ic["output_dir"], f"{ic['infer_start']}_{ic['infer_end']}")
     os.makedirs(run_dir, exist_ok=True)
-    paths = {b: os.path.join(run_dir, f"rec_{b}.parquet") for b in ic["behaviors"]}
-    writers = {b: ParquetRecWriter(p, sid2items, ic["topk"])
-               for b, p in paths.items()}
+    paths = {g: os.path.join(run_dir, f"rec_{g}.parquet")
+             for g, _, _ in ic["groups"]}
+    writers = {g: ParquetRecWriter(p, sid2items, ic["topk"])
+               for g, p in paths.items()}
     t_start = time.time()
     try:
         stats = generate_for_users(model, tok, trie,
@@ -234,16 +256,16 @@ def main():
             w.close()
     wall_s = time.time() - t_start
 
-    total_req = sum(s["n"] for s in stats.values())      # 1 用户 x 1 行为 = 1 次生成
+    total_req = sum(s["n"] for s in stats.values())      # 1 用户 x 1 组合 = 1 次生成
     total_inf = sum(s["infer_s"] for s in stats.values())
     print("\n================ 推理完成 ================")
-    for b in ic["behaviors"]:
-        s = stats[b]
+    for g, _, _ in ic["groups"]:
+        s = stats[g]
         if s["n"]:
-            print(f"  {b}: {s['n']} 用户  纯推理 {s['infer_s']:.1f}s  "
+            print(f"  {g}: {s['n']} 用户  纯推理 {s['infer_s']:.1f}s  "
                   f"QPS {s['n'] / max(s['infer_s'], 1e-9):.1f}  "
                   f"({s['infer_s'] / s['n'] * 1000:.1f}ms/用户)")
-        print(f"  结果: {paths[b]}")
+        print(f"  结果: {paths[g]}")
     print(f"  合计: {total_req} 次生成  纯推理 QPS "
           f"{total_req / max(total_inf, 1e-9):.1f}  |  全流程 {wall_s:.1f}s"
           f"（含取数/编码/写盘）端到端 QPS {total_req / max(wall_s, 1e-9):.1f}")
@@ -252,6 +274,7 @@ def main():
     meta = {
         "infer_start": ic["infer_start"], "infer_end": ic["infer_end"],
         "infer_max_num": ic["infer_max_num"], "behaviors": ic["behaviors"],
+        "groups": [g for g, _, _ in ic["groups"]],
         "topk": ic["topk"], "beam_size": ic["beam_size"],
         "batch_size": ic["batch_size"], "ckpt_path": ic["ckpt_path"],
         "ckpt_epoch": meta["epoch"], "ckpt_val_loss": round(meta["val_loss"], 4),

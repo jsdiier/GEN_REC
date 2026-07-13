@@ -24,16 +24,20 @@ import json
 from torch.utils.data import Dataset
 
 
+def _stride(tokenizer) -> int:
+    """每交互 token 数：优先用 tokens_per_interaction（含时段位），旧词表回退。"""
+    return getattr(tokenizer, "tokens_per_interaction", 1 + tokenizer.num_levels)
+
+
 def encode_train_record(tokenizer, items: list, max_len: int) -> dict:
-    """train 序列 [(action, geo_sid)... 或 token dict...] -> 模型输入（全 token 监督）。"""
-    stride = 1 + tokenizer.num_levels
-    keep = max((max_len - 1) // stride, 1)                 # 至少留 1 个交互
+    """train 序列 [(action, geo_sid[, period])... 或 token dict...] -> 全 token 监督输入。"""
+    keep = max((max_len - 1) // _stride(tokenizer), 1)     # 至少留 1 个交互
     return tokenizer.encode_train_sample({"token_seq": items[-keep:]})
 
 
 def encode_val_record(tokenizer, inp: list, label: list, max_len: int) -> dict:
     """val 的 input 区 + label 区 -> teacher-forcing 样本（labels 仅 label 区有效）。"""
-    stride = 1 + tokenizer.num_levels
+    stride = _stride(tokenizer)
     keep_lb = max((max_len - 1) // stride, 1)
     label = label[:keep_lb]                                # label 区过长截尾（极少发生）
     keep_in = (max_len - 1 - len(label) * stride) // stride

@@ -162,11 +162,15 @@ def build_scheduler(optimizer, epochs: int, warmup_ratio: float,
 # ------------------------------------------------------------------
 def build_slot_defs(tok, device) -> dict:
     """token 位定义：{位名: (token_types 取值, 该位合法 token id 张量)}。
-       behavior=行为位；sid1..sidl=SID 各层（sid1=geo, sid2=a, ...）。"""
+       behavior=行为位；sid1..sidl=SID 各层（sid1=geo, sid2=a, ...）；
+       period=时段位（词表含时段时才有，type=num_levels+1）。"""
     defs = {"behavior": (0, torch.tensor(
         [tok.token2id[f"<{b}>"] for b in tok.behaviors], device=device))}
     for j, ids in enumerate(tok.level_token_ids, start=1):
         defs[f"sid{j}"] = (j, torch.tensor(ids, device=device))
+    if getattr(tok, "periods", []):
+        defs["period"] = (tok.period_type, torch.tensor(
+            [tok.token2id[f"<{p}>"] for p in tok.periods], device=device))
     return defs
 
 
@@ -294,6 +298,7 @@ def main():
     cfg = GAMERConfig(vocab_size=tok.vocab_size,
                       tokens_per_item=tok.num_levels,
                       num_behaviors=len(tok.behaviors),
+                      num_periods=len(getattr(tok, "periods", [])),
                       behavior_levels=tok.behavior_levels,
                       max_position_embeddings=tc["max_len"],
                       pad_token_id=tok.pad_id)

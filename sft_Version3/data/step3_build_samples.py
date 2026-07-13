@@ -111,8 +111,8 @@ def _fmt_tok(t: dict) -> str:
 
 
 def _slim(tokens: list) -> list:
-    """token dict 列表 -> [(action, geo_sid), ...]，落盘只留模型需要的两个字段。"""
-    return [(t["action"], t["geo_sid"]) for t in tokens]
+    """token dict 列表 -> [(action, geo_sid, meal_period), ...]，落盘只留模型需要的字段。"""
+    return [(t["action"], t["geo_sid"], t["meal_period"]) for t in tokens]
 
 
 def positives_by_action(label_tokens: list) -> dict:
@@ -121,6 +121,17 @@ def positives_by_action(label_tokens: list) -> dict:
     g = {}
     for t in label_tokens:
         lst = g.setdefault(t["action"], [])
+        if t["geo_sid"] not in lst:
+            lst.append(t["geo_sid"])
+    return g
+
+
+def positives_by_action_period(label_tokens: list) -> dict:
+    """label 区按 (行为, 时段) 分组成正样本集合（去重，保序）：
+       {action: {period: [geo_sid, ...]}}。供时段条件评测用。"""
+    g = {}
+    for t in label_tokens:
+        lst = g.setdefault(t["action"], {}).setdefault(t["meal_period"], [])
         if t["geo_sid"] not in lst:
             lst.append(t["geo_sid"])
     return g
@@ -136,6 +147,7 @@ def _make_eval_sample(uid, split, input_tokens, label_date, label_tokens) -> dic
         "input": input_tokens,
         "label_tokens": label_tokens,
         "positives_by_action": positives_by_action(label_tokens),
+        "positives_by_action_period": positives_by_action_period(label_tokens),
         "label_date": label_date,
     }
 
@@ -334,6 +346,7 @@ def main():
                 rec = {"uid": s["uid"], "input": _slim(s["input"]),
                        "label_tokens": _slim(s["label_tokens"]),
                        "positives_by_action": s["positives_by_action"],
+                       "positives_by_action_period": s["positives_by_action_period"],
                        "label_date": s["label_date"]}
             if writers:
                 writers[s["split"]].write(json.dumps(rec, ensure_ascii=False) + "\n")

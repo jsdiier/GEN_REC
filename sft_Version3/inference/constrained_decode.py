@@ -29,18 +29,30 @@ import torch
 import torch.nn.functional as F
 
 
-def make_prefix(tok, items: list, behavior: str, max_len: int) -> dict:
-    """[BOS] + 历史交互（按交互粒度左截断）+ 强制行为 token。
+def make_prefix(tok, items: list, behavior: str, max_len: int,
+                period: str = None) -> dict:
+    """[BOS] + 历史交互（按交互粒度左截断）+ 强制条件 token（[时段+]行为）。
        预留 num_levels 个生成位，保证总长 <= max_len。
-       eval（input=S1..S(m-1)）与 inference（全部历史）共用。"""
-    stride = 1 + tok.num_levels
-    keep = max((max_len - 2 - tok.num_levels) // stride, 1)
+       eval（input=S1..S(m-1)）与 inference（全部历史）共用。
+       词表含时段位时必须传 period（生成条件 = <时段><行为>）。"""
+    stride = getattr(tok, "tokens_per_interaction", 1 + tok.num_levels)
+    has_period = bool(getattr(tok, "periods", []))
+    if has_period and period is None:
+        raise ValueError("词表含时段位，make_prefix 必须传 period")
+    tail = 2 if has_period else 1                    # 强制条件 token 数
+    keep = max((max_len - 1 - tail - tok.num_levels) // stride, 1)
     ids, beh, types = tok.encode_items(items[-keep:])
     b = tok.behavior2id[behavior]
+    tail_ids, tail_types = [], []
+    if has_period:
+        tail_ids.append(tok.token2id[f"<{period}>"])
+        tail_types.append(tok.period_type)
+    tail_ids.append(tok.token2id[f"<{behavior}>"])
+    tail_types.append(0)
     return {
-        "input_ids": [tok.bos_id] + ids + [tok.token2id[f"<{behavior}>"]],
-        "behavior_ids": [-1] + beh + [b],
-        "token_types": [-1] + types + [0],
+        "input_ids": [tok.bos_id] + ids + tail_ids,
+        "behavior_ids": [-1] + beh + [b] * tail,
+        "token_types": [-1] + types + tail_types,
     }
 
 

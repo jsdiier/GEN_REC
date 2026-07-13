@@ -37,6 +37,8 @@ PAD, BOS, EOS = "<pad>", "<bos>", "<eos>"
 # 行为 -> 层级（与 data/step3 的 BEHAVIOR_LEVELS、GAMERConfig.behavior_levels 保持一致；
 # 行为 id 按层级升序编号：clk=0, pay=1）
 BEHAVIOR_LEVELS = {"clk": 1, "pay": 2}
+# 时段分桶（与 data/step2 的 get_meal_period 保持一致；顺序 = 时段 id）
+PERIODS = ["bf", "lc", "dn"]
 
 
 def split_sid(geo_sid: str) -> list:
@@ -49,23 +51,33 @@ def split_sid(geo_sid: str) -> list:
 
 class SIDTokenizer:
     def __init__(self, token2id: dict, behaviors: list, num_levels: int,
-                 level_token_ids: list):
+                 level_token_ids: list, periods: list = None):
         self.token2id = token2id
         self.id2token = {v: k for k, v in token2id.items()}
         self.behaviors = behaviors                      # 行为名列表，下标 = 行为 id
         self.behavior2id = {b: i for i, b in enumerate(behaviors)}
         self.num_levels = num_levels                    # 每个 item 的 SID 层数 l
         self.level_token_ids = level_token_ids          # [ [该层全部 token id], ... ]
+        self.periods = periods or []                    # 时段名列表（空 = 无时段位）
+        self.period_type = num_levels + 1               # 时段 token 的 token_types 值
         self.pad_id = token2id[PAD]
         self.bos_id = token2id[BOS]
         self.eos_id = token2id[EOS]
 
+    @property
+    def tokens_per_interaction(self) -> int:
+        """每个交互的 token 数：[时段] + 行为 + l 层 SID。"""
+        return (2 if self.periods else 1) + self.num_levels
+
     # ---------------- 构建 / 存取 ----------------
     @classmethod
-    def from_item_map(cls, parquet_path: str, behaviors=None):
-        """扫 item map 的 geo_sid 列建词表。层数取多数派，层数异常的 sid 丢弃并告警。"""
+    def from_item_map(cls, parquet_path: str, behaviors=None, periods=None):
+        """扫 item map 的 geo_sid 列建词表。层数取多数派，层数异常的 sid 丢弃并告警。
+           periods 非空时词表含时段 token（<bf> 等），序列形态变为
+           时段+行为+SID；传 [] 可显式构建无时段词表。"""
         import pyarrow.parquet as pq
         behaviors = behaviors or sorted(BEHAVIOR_LEVELS, key=BEHAVIOR_LEVELS.get)
+        periods = PERIODS if periods is None else periods
         col = pq.read_table(parquet_path, columns=["geo_sid"]).column("geo_sid").to_pylist()
 
         level_cnt = Counter()
@@ -96,6 +108,8 @@ class SIDTokenizer:
         token2id = {PAD: 0, BOS: 1, EOS: 2}
         for b in behaviors:
             token2id[f"<{b}>"] = len(token2id)
+        for p in periods:
+            token2id[f"<{p}>"] = len(token2id)
         level_token_ids = []
         for lv in range(num_levels):
             ids = []
@@ -103,7 +117,7 @@ class SIDTokenizer:
                 token2id[tok] = len(token2id)
                 ids.append(token2id[tok])
             level_token_ids.append(ids)
-        return cls(token2id, behaviors, num_levels, level_token_ids)
+        return cls(token2id, behaviors, num_levels, level_token_ids, periods)
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -113,13 +127,15 @@ class SIDTokenizer:
                 "behaviors": self.behaviors,
                 "num_levels": self.num_levels,
                 "level_token_ids": self.level_token_ids,
+                "periods": self.periods,
             }, f, ensure_ascii=False)
 
     @classmethod
     def load(cls, path: str):
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        return cls(d["token2id"], d["behaviors"], d["num_levels"], d["level_token_ids"])
+        return cls(d["token2id"], d["behaviors"], d["num_levels"],
+                   d["level_token_ids"], d.get("periods", []))
 
     @property
     def vocab_size(self) -> int:
@@ -132,24 +148,32 @@ class SIDTokenizer:
 
     # ---------------- 编码 ----------------
     def _norm_items(self, items) -> list:
-        """兼容 step3 的 token dict（取 action/geo_sid）与 (action, geo_sid) 元组。"""
+        """兼容 step3 的 token dict（取 action/geo_sid/meal_period）与
+           (action, geo_sid[, period]) 元组，统一为三元组（无时段词表时 period=None）。"""
         out = []
         for it in items:
             if isinstance(it, dict):
-                out.append((it["action"], it["geo_sid"]))
+                out.append((it["action"], it["geo_sid"], it.get("meal_period")))
             else:
-                out.append((it[0], it[1]))
+                out.append((it[0], it[1], it[2] if len(it) > 2 else None))
         return out
 
     def encode_items(self, items):
-        """[(action, geo_sid), ...] -> (input_ids, behavior_ids, token_types)，不含 BOS。
-           每个交互 = 1 行为 token + num_levels 个 SID token。"""
+        """交互列表 -> (input_ids, behavior_ids, token_types)，不含 BOS。
+           每个交互 = [时段 token +] 行为 token + num_levels 个 SID token；
+           时段 token 的 token_types = num_levels+1，behavior_ids 沿用所属交互行为。"""
         ids, beh, types = [], [], []
-        for action, geo_sid in self._norm_items(items):
+        for action, geo_sid, period in self._norm_items(items):
             b = self.behavior2id[action]                # 未知行为直接 KeyError 暴露问题
             parts = split_sid(geo_sid)
             if len(parts) != self.num_levels:
                 raise ValueError(f"geo_sid 层数 {len(parts)} != 词表层数 {self.num_levels}: {geo_sid!r}")
+            if self.periods:
+                if period is None:
+                    raise ValueError(f"词表含时段位但交互缺 meal_period: {(action, geo_sid)!r}")
+                ids.append(self.token2id[f"<{period}>"])  # 未知时段直接 KeyError
+                beh.append(b)
+                types.append(self.period_type)
             ids.append(self.token2id[f"<{action}>"])
             beh.append(b)
             types.append(0)                             # 行为 token
@@ -185,18 +209,26 @@ class SIDTokenizer:
 
     # ---------------- 解码 ----------------
     def decode(self, ids) -> list:
-        """id 序列 -> [(action, geo_sid), ...]。跳过 special；遇到行为 token 开始收一个
-           item 的 num_levels 个 SID token，不完整的尾部 item 丢弃。"""
+        """id 序列 -> [(action, geo_sid, period), ...]（无时段词表时 period=None）。
+           跳过 special；遇到 [时段+]行为 token 开始收一个 item 的 num_levels 个
+           SID token，不完整的尾部 item 丢弃。"""
         beh_tokens = {self.token2id[f"<{b}>"]: b for b in self.behaviors}
+        per_tokens = {self.token2id[f"<{p}>"]: p for p in self.periods}
         level_sets = [set(ids_) for ids_ in self.level_token_ids]
         out, i, n = [], 0, len(ids)
         while i < n:
-            tid = ids[i]
-            span = ids[i + 1: i + 1 + self.num_levels]
+            period = None
+            j = i
+            if self.periods and ids[j] in per_tokens and j + 1 < n:
+                period = per_tokens[ids[j]]
+                j += 1
+            tid = ids[j]
+            span = ids[j + 1: j + 1 + self.num_levels]
             if tid in beh_tokens and len(span) == self.num_levels and \
                     all(t in level_sets[lv] for lv, t in enumerate(span)):
-                out.append((beh_tokens[tid], "".join(self.id2token[t] for t in span)))
-                i += 1 + self.num_levels
+                out.append((beh_tokens[tid],
+                            "".join(self.id2token[t] for t in span), period))
+                i = j + 1 + self.num_levels
             else:
                 i += 1                                  # special / 残缺片段，跳过
         return out
@@ -215,46 +247,75 @@ def _build_from_conf(conf_path: str, out_path: str):
     tok.save(out_path)
     print(f"[INFO] vocab 已保存: {out_path}")
     print(f"[INFO] vocab_size={tok.vocab_size}  num_levels={tok.num_levels}  "
-          f"behaviors={tok.behaviors}")
+          f"behaviors={tok.behaviors}  periods={tok.periods}  "
+          f"每交互 token 数={tok.tokens_per_interaction}")
     for lv, ids in enumerate(tok.level_token_ids):
         print(f"  SID 第{lv + 1}层 token 数: {len(ids)}")
 
 
 def _selftest():
-    """无 parquet 依赖的自测：手工建小词表，验证 encode/decode 往返与 val mask。"""
+    """无 parquet 依赖的自测：手工建小词表，验证 encode/decode 往返与 val mask
+       （无时段 / 有时段两种形态都测）。"""
     behaviors = ["clk", "pay"]
-    token2id = {PAD: 0, BOS: 1, EOS: 2, "<clk>": 3, "<pay>": 4}
-    level_tokens = [["<g1>", "<g2>"], ["<a_0>", "<a_1>"], ["<b_0>", "<b_1>"], ["<c_0>", "<c_1>"]]
-    level_token_ids = []
-    for toks in level_tokens:
-        ids = []
-        for t in toks:
-            token2id[t] = len(token2id)
-            ids.append(token2id[t])
-        level_token_ids.append(ids)
-    tok = SIDTokenizer(token2id, behaviors, 4, level_token_ids)
 
+    def build(periods):
+        token2id = {PAD: 0, BOS: 1, EOS: 2, "<clk>": 3, "<pay>": 4}
+        for p in periods:
+            token2id[f"<{p}>"] = len(token2id)
+        level_tokens = [["<g1>", "<g2>"], ["<a_0>", "<a_1>"],
+                        ["<b_0>", "<b_1>"], ["<c_0>", "<c_1>"]]
+        level_token_ids = []
+        for toks in level_tokens:
+            ids = []
+            for t in toks:
+                token2id[t] = len(token2id)
+                ids.append(token2id[t])
+            level_token_ids.append(ids)
+        return SIDTokenizer(token2id, behaviors, 4, level_token_ids, periods)
+
+    # ---- 无时段（旧形态，每交互 5 token）----
+    tok = build([])
     items = [("clk", "<g1><a_0><b_1><c_0>"), ("pay", "<g2><a_1><b_0><c_1>")]
     train = tok.encode_train_sample({"token_seq": items})
+    assert tok.tokens_per_interaction == 5
     assert len(train["input_ids"]) == 1 + 2 * 5
     assert train["behavior_ids"] == [-1] + [0] * 5 + [1] * 5
     assert train["token_types"] == [-1, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
     assert train["labels"] == train["input_ids"]
-    assert tok.decode(train["input_ids"]) == items      # 往返一致（BOS 被跳过）
+    assert tok.decode(train["input_ids"]) == [i + (None,) for i in items]
 
     val = tok.encode_val_sample({"input": items[:1], "label_tokens": items[1:]})
     assert val["labels"][:6] == [-100] * 6              # BOS + input 区 5 token
     assert val["labels"][6:] == val["input_ids"][6:]    # label 区原样
-    assert tok.decode([t for t in val["labels"] if t != -100]) == items[1:]
 
-    # save/load 往返
+    # ---- 有时段（每交互 6 token：时段+行为+4 SID）----
+    tkp = build(["bf", "lc", "dn"])
+    items_p = [("clk", "<g1><a_0><b_1><c_0>", "bf"),
+               ("pay", "<g2><a_1><b_0><c_1>", "dn")]
+    tr = tkp.encode_train_sample({"token_seq": items_p})
+    assert tkp.tokens_per_interaction == 6
+    assert len(tr["input_ids"]) == 1 + 2 * 6
+    assert tr["input_ids"][1] == tkp.token2id["<bf>"]   # 时段在行为前
+    assert tr["input_ids"][2] == tkp.token2id["<clk>"]
+    assert tr["behavior_ids"] == [-1] + [0] * 6 + [1] * 6
+    assert tr["token_types"] == [-1, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4]
+    assert tkp.period_type == 5
+    assert tkp.decode(tr["input_ids"]) == items_p       # 往返含时段
+    # 缺时段报错
+    try:
+        tkp.encode_items([("clk", "<g1><a_0><b_1><c_0>")])
+        raise AssertionError("缺 meal_period 应报错")
+    except ValueError:
+        pass
+
+    # save/load 往返（含 periods）
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "vocab.json")
-        tok.save(p)
+        tkp.save(p)
         tok2 = SIDTokenizer.load(p)
-        assert tok2.token2id == tok.token2id and tok2.num_levels == 4
-        assert tok2.encode_train_sample({"token_seq": items}) == train
+        assert tok2.periods == ["bf", "lc", "dn"] and tok2.num_levels == 4
+        assert tok2.encode_train_sample({"token_seq": items_p}) == tr
     assert tok.behavior_levels == (1, 2)
     print("selftest passed")
 

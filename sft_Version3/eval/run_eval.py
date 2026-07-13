@@ -13,9 +13,9 @@ run_eval: 独立 test 窗口的端到端评测（GAMER 推理 -> HR/Recall/NDCG 
        - crc32(uid) % 10000 < test_sample_rate*10000（确定性抽样；test_max_num>0
          时攒够即早停供小规模快测，-1 扫完整窗保证严格可复现）；
   3. 加载 ckpt（默认 best.pt）+ 用 item map 全量真实 item 建 SID 前缀树；
-  4. 行为条件评测：对 clk / pay 各跑一遍——input 末尾强制接该行为 token，
-     trie 约束 beam search 生成 top-K item，与 label session 中该行为的正样本
-     集合比对；label 里没有该行为的用户跳过（不稀释指标）；
+  4. 条件评测：按 (行为 x 时段) 组合各跑一遍（词表无时段位时退化为按行为）——
+     input 末尾强制接 <时段><行为> token，trie 约束 beam search 生成 top-K item，
+     与 label session 中该组的正样本集合比对；label 里没有该组的用户跳过；
   5. 报表：分行为 x 分 K 的 HR/Recall/NDCG + 热门 item 基线对照 +
      clk/pay 测试数据占比分布；预测明细落盘 outputs/predictions/ 供 case 分析。
 
@@ -126,6 +126,7 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
             "uid": test["uid"],
             "input": step3._slim(test["input"]),
             "positives_by_action": test["positives_by_action"],
+            "positives_by_action_period": test["positives_by_action_period"],
             "label_date": test["label_date"],
         })
         if 0 < ec["test_max_num"] <= len(samples):
@@ -138,12 +139,20 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
 # ------------------------------------------------------------------
 # 行为条件评测
 # ------------------------------------------------------------------
+def group_labels(s: dict, behavior: str, period: str):
+    """取一个 test 样本在 (行为[, 时段]) 组的正样本列表；无则返回 None。"""
+    if period is None:
+        return s["positives_by_action"].get(behavior)
+    return s.get("positives_by_action_period", {}).get(behavior, {}).get(period)
+
+
 def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
-                  device, autocast_ctx, pop_ranked: list, pred_path: str) -> dict:
-    """对 label 里含该行为的用户跑约束 beam search 并累计指标。
+                  device, autocast_ctx, pop_ranked: list, pred_path: str,
+                  period: str = None) -> dict:
+    """对 label 里含该 (行为[, 时段]) 组的用户跑约束 beam search 并累计指标。
+       词表含时段位时按 <时段><行为> 条件生成，与 label 中该组的正样本比对。
        返回 {"model": report, "pop": report, "n": 用户数, "avg_labels": 平均正样本数}。"""
-    eligible = [s for s in samples
-                if s["positives_by_action"].get(behavior)]
+    eligible = [s for s in samples if group_labels(s, behavior, period)]
     acc, acc_pop = MetricAccumulator(ec["topk"]), MetricAccumulator(ec["topk"])
     L = tok.num_levels
     pfx, pfx_pop = PrefixHRAccumulator(ec["topk"], L), PrefixHRAccumulator(ec["topk"], L)
@@ -156,7 +165,8 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
     with open(pred_path, "w", encoding="utf-8") as fout:
         for lo in range(0, len(eligible), ec["batch_size"]):
             batch = eligible[lo: lo + ec["batch_size"]]
-            prefixes = [make_prefix(tok, s["input"], behavior, ec["max_len"])
+            prefixes = [make_prefix(tok, s["input"], behavior, ec["max_len"],
+                                    period=period)
                         for s in batch]
             t_inf = time.time()
             results = constrained_beam_search(model, tok, trie, prefixes,
@@ -164,7 +174,7 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
             infer_s += time.time() - t_inf
             n_batches += 1
             for s, beams in zip(batch, results):
-                labels = s["positives_by_action"][behavior]
+                labels = group_labels(s, behavior, period)
                 ranked = [sid for sid, _ in beams]
                 acc.add(rank_metrics(ranked, labels, ec["topk"]))
                 acc_pop.add(rank_metrics(pop_ranked, labels, ec["topk"]))
@@ -172,13 +182,14 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
                 pfx_pop.add(prefix_hr(pop_ranked, labels, ec["topk"], L))
                 n_labels += len(labels)
                 fout.write(json.dumps({
-                    "uid": s["uid"], "behavior": behavior,
+                    "uid": s["uid"], "behavior": behavior, "period": period,
                     "label_date": s["label_date"], "labels": labels,
                     "topk": [(sid, round(sc, 4)) for sid, sc in beams[:max_k]],
                 }, ensure_ascii=False) + "\n")
             done = lo + len(batch)
             if done % (ec["batch_size"] * 20) < ec["batch_size"]:
-                print(f"  [{behavior}] {done}/{len(eligible)} 用户 "
+                tag = behavior if period is None else f"{behavior}x{period}"
+                print(f"  [{tag}] {done}/{len(eligible)} 用户 "
                       f"({time.time() - t0:.0f}s)")
     return {"model": acc.report(), "pop": acc_pop.report(),
             "prefix_model": pfx.report(), "prefix_pop": pfx_pop.report(),
@@ -187,9 +198,13 @@ def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
             "wall_s": time.time() - t0}
 
 
-def popularity_ranked(samples: list, behavior: str, k: int) -> list:
-    """基线：test 用户 input 区中该行为交互的 item 频次 top-k。"""
-    cnt = Counter(sid for s in samples for a, sid in s["input"] if a == behavior)
+def popularity_ranked(samples: list, behavior: str, k: int,
+                      period: str = None) -> list:
+    """基线：test 用户 input 区中该 (行为[, 时段]) 组交互的 item 频次 top-k。
+       input 项为 (action, geo_sid[, period]) 元组。"""
+    cnt = Counter(it[1] for s in samples for it in s["input"]
+                  if it[0] == behavior and
+                  (period is None or (len(it) > 2 and it[2] == period)))
     return [sid for sid, _ in cnt.most_common(k)]
 
 
@@ -255,14 +270,16 @@ def main():
           f"剔除 <3 session {stats['skip_lt3_sessions']}, "
           f"最终 {stats['test_users']} 用户")
 
-    # clk/pay 占比分布
-    n_clk = sum(1 for s in samples if s["positives_by_action"].get("clk"))
-    n_pay = sum(1 for s in samples if s["positives_by_action"].get("pay"))
-    n_both = sum(1 for s in samples if s["positives_by_action"].get("clk")
-                 and s["positives_by_action"].get("pay"))
+    # (行为[, 时段]) 组的用户覆盖分布；词表无时段位时退化为单纯行为组
+    periods = list(getattr(tok, "periods", [])) or [None]
+    groups = [(b, p) for b in tok.behaviors for p in periods]
     n = max(len(samples), 1)
-    print(f"[INFO] label 行为分布: 含clk {n_clk} ({n_clk / n:.1%})  "
-          f"含pay {n_pay} ({n_pay / n:.1%})  两者都有 {n_both} ({n_both / n:.1%})")
+    dist = "  ".join(
+        f"{b if p is None else f'{b}x{p}'} "
+        f"{sum(1 for s in samples if group_labels(s, b, p))} "
+        f"({sum(1 for s in samples if group_labels(s, b, p)) / n:.1%})"
+        for b, p in groups)
+    print(f"[INFO] label 组覆盖: {dist}")
 
     trie = build_sid_trie(tok, id2sid.values())
     print(f"[INFO] SID trie 构建完成（覆盖 {len(set(id2sid.values()))} 个真实 item）")
@@ -271,16 +288,19 @@ def main():
 
     os.makedirs(ec["predictions_out_dir"], exist_ok=True)
     reports = {}
-    for behavior in tok.behaviors:
-        pop = popularity_ranked(samples, behavior, max(ec["topk"]))
-        pred_path = os.path.join(ec["predictions_out_dir"], f"pred_{behavior}.jsonl")
-        reports[behavior] = eval_behavior(model, tok, trie, samples, behavior, ec,
-                                          device, autocast_ctx, pop, pred_path)
-        print(f"[INFO] {behavior} 预测明细已落盘: {pred_path}")
+    for b, p in groups:
+        tag = b if p is None else f"{b}_{p}"
+        pop = popularity_ranked(samples, b, max(ec["topk"]), period=p)
+        pred_path = os.path.join(ec["predictions_out_dir"], f"pred_{tag}.jsonl")
+        reports[(b, p)] = eval_behavior(model, tok, trie, samples, b, ec,
+                                        device, autocast_ctx, pop, pred_path,
+                                        period=p)
+        print(f"[INFO] {tag} 预测明细已落盘: {pred_path}")
 
     print("\n================ 评测报表 ================")
-    for behavior in tok.behaviors:
-        print_report(behavior, reports[behavior], ec["topk"], level_tags)
+    for b, p in groups:
+        print_report(b if p is None else f"{b} x {p}",
+                     reports[(b, p)], ec["topk"], level_tags)
     print("\n（HR=top-K 命中任一正样本；Recall=命中数/正样本数；NDCG 按命中位置加权。"
           "热门基线 = test 用户 input 区该行为 item 频次 top-K，模型显著高于它才说明学到了个性化）")
     print("==========================================")
