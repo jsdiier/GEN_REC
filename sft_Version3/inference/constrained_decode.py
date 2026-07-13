@@ -120,16 +120,21 @@ def _extend(prefix: dict, tid: int, behavior_id: int, token_type: int) -> dict:
 
 @torch.no_grad()
 def constrained_beam_search(model, tokenizer, trie: dict, prefixes: list,
-                            beam_size: int, device, autocast_ctx) -> list:
+                            beam_size: int, device, autocast_ctx,
+                            roots: list = None) -> list:
     """对 batch 内每条 prefix 做 trie 约束 beam search，生成 num_levels 个 SID token。
        prefix 末 token 必须是行为 token（行为条件已由调用方拼好）。
+       roots: 可选，逐条覆盖第 0 层（geo）的候选根（如收藏坐标邻域限定的 geo token
+       子集，{tid: trie[tid], ...}），不传则从完整 trie 出发；某条为空 dict 时该
+       beam 直接产出 0 条结果（调用方按"该组合跳过"处理）。
        返回 results[i] = [(geo_sid, score), ...] 分数降序，最多 beam_size 条。"""
     model.eval()
     n = len(prefixes)
     beh_of = [p["behavior_ids"][-1] for p in prefixes]      # 生成 token 沿用行为 id
 
     # beams[i] = [(seq_dict, score, trie_node), ...]；第 0 步只有 prefix 一条
-    beams = [[(p, 0.0, trie)] for p in prefixes]
+    roots = roots if roots is not None else [trie] * n
+    beams = [[(p, 0.0, roots[i])] if roots[i] else [] for i, p in enumerate(prefixes)]
 
     for lv in range(tokenizer.num_levels):
         flat, owner = [], []                                # 展平所有活跃 beam 做一次 forward
@@ -137,6 +142,8 @@ def constrained_beam_search(model, tokenizer, trie: dict, prefixes: list,
             for b in beams[i]:
                 flat.append(b[0])
                 owner.append(i)
+        if not flat:                                        # 全部 root 为空（罕见），提前结束
+            break
         logprobs = _last_logprobs(model, flat, tokenizer.pad_id, device, autocast_ctx)
 
         new_beams = [[] for _ in range(n)]
