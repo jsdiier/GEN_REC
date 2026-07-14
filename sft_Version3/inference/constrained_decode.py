@@ -28,6 +28,11 @@ prefix 契约：每条 prefix 是 dict {input_ids, behavior_ids, token_types}，
 import torch
 import torch.nn.functional as F
 
+try:
+    from tqdm import tqdm
+except ImportError:                            # 未安装时静默降级，不影响功能
+    tqdm = None
+
 
 def make_prefix(tok, items: list, behavior: str, max_len: int,
                 period: str = None) -> dict:
@@ -58,10 +63,15 @@ def make_prefix(tok, items: list, behavior: str, max_len: int,
 
 def build_sid_trie(tokenizer, geo_sids) -> dict:
     """全部真实 item 的 geo_sid 字符串 -> token id 前缀树（嵌套 dict，叶子为空 dict）。
-       编码失败的 sid（层数异常/词表外 token）跳过并计数告警。"""
+       编码失败的 sid（层数异常/词表外 token）跳过并计数告警。
+       geo_sids 常是千万级 item，纯 Python 逐条 split+建树没有中间产物可读字节，
+       用 tqdm 按已处理条目数出进度条（未装 tqdm 时静默降级，不影响功能）。"""
     from tokenizer_sid import split_sid
     root, n_bad = {}, 0
-    for sid in set(geo_sids):
+    unique_sids = set(geo_sids)
+    iterator = tqdm(unique_sids, desc="构建 SID trie", unit="item") \
+        if tqdm else unique_sids
+    for sid in iterator:
         try:
             parts = split_sid(sid)
             if len(parts) != tokenizer.num_levels:
@@ -100,14 +110,17 @@ def _pad_batch(seqs: list, pad_id: int, device):
 
 @torch.no_grad()
 def _last_logprobs(model, seqs, pad_id, device, autocast_ctx):
-    """batch forward，取各序列末位 token 的 log_softmax(logits)。(n, V) float32。"""
+    """batch forward，取各序列末位 token 的 log_softmax(logits)。(n, V) float32。
+       传 last_positions 让模型只在 lm_head 投影末位隐状态（(B,vocab) 而非
+       (B,L,vocab)）——序列长、beam 宽时能省下 L 倍的 lm_head 显存/算力，
+       是约束解码在长历史场景下不 OOM 的关键（vocab 远大于 hidden_size，
+       lm_head 是单步里最贵的一层，多算的 L-1 个位置纯属浪费）。"""
     input_ids, behavior_ids, token_types, attn, lengths = _pad_batch(seqs, pad_id, device)
     with autocast_ctx():
-        _, logits = model(input_ids=input_ids, behavior_ids=behavior_ids,
-                          token_types=token_types, attention_mask=attn)
-    idx = (lengths - 1).view(-1, 1, 1).expand(-1, 1, logits.size(-1))
-    last = logits.gather(1, idx).squeeze(1).float()
-    return F.log_softmax(last, dim=-1)
+        _, last = model(input_ids=input_ids, behavior_ids=behavior_ids,
+                        token_types=token_types, attention_mask=attn,
+                        last_positions=lengths - 1)
+    return F.log_softmax(last.float(), dim=-1)
 
 
 def _extend(prefix: dict, tid: int, behavior_id: int, token_type: int) -> dict:

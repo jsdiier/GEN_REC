@@ -284,8 +284,15 @@ class GAMERModel(nn.Module):
                 nn.init.zeros_(module.weight[module.padding_idx])
 
     def forward(self, input_ids, behavior_ids, token_types,
-                attention_mask=None, labels=None):
-        """返回 (loss, logits)；labels 为 None 时 loss 为 None。"""
+                attention_mask=None, labels=None, last_positions=None):
+        """返回 (loss, logits)；labels 为 None 时 loss 为 None。
+           last_positions: (B,) 可选，仅解码场景使用——每条序列只要最后一个
+           有效位置的 logits 时传入（如 constrained_decode 的逐步生成），在
+           lm_head 投影【之前】先按位置 gather 隐状态，避免对 (B,L,D) 整条
+           序列做 (B,L,vocab) 的 lm_head 投影（vocab 远大于 D，是显存/算力的
+           大头；L 越长、beam 越宽，白算的浪费越大，是推理 OOM 的常见根源）。
+           传了 last_positions 时返回的 logits 形状是 (B, vocab)，不是 (B,L,vocab)；
+           与 labels 全序列 loss 互斥（训练路径不传，行为不变）。"""
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         pad_mask = attention_mask.bool()
@@ -296,8 +303,13 @@ class GAMERModel(nn.Module):
             x = layer(x, self.rope_cos, self.rope_sin,
                       behavior_ids, levels, token_types, pad_mask)
         x = self.norm(x)
-        logits = self.lm_head(x)
 
+        if last_positions is not None:
+            idx = last_positions.view(-1, 1, 1).expand(-1, 1, x.size(-1))
+            x = x.gather(1, idx).squeeze(1)         # (B, D)：只留需要的位置
+            return None, self.lm_head(x)            # (B, vocab)
+
+        logits = self.lm_head(x)
         loss = None
         if labels is not None:
             # 内部 shift：预测下一个 token；labels 直接传 input_ids 即全 token 监督

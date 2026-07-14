@@ -40,10 +40,16 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 try:
+    import pyarrow as pa
     import pyarrow.parquet as pq
 except ImportError:
     print("[ERROR] 需要 pyarrow，请先 pip install pyarrow", file=sys.stderr)
     sys.exit(1)
+
+try:
+    from tqdm import tqdm
+except ImportError:                            # 未安装时静默降级，不影响功能
+    tqdm = None
 
 from step1_get_user_action import load_config, stream_rows, parse_item_seq
 
@@ -59,10 +65,29 @@ def get_item_map_path(conf_path: str) -> str:
 
 
 def load_item_sid_map(path: str) -> dict:
-    """加载 item_id -> geo_sid 映射（只读两列，item_id 统一转成 str 作 key）。"""
+    """加载 item_id -> geo_sid 映射（只读两列，item_id 统一转成 str 作 key）。
+       item map 常是千万行级大表，逐 row group 读 + tqdm 按压缩字节数出进度条
+       （比按行数准，行数对应的实际 I/O 量因列压缩率而不均匀）；未装 tqdm 时
+       静默降级为无进度条的整表读取，功能不受影响。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"映射表不存在: {path}")
-    table = pq.read_table(path, columns=["item_id", "geo_sid"])
+    if tqdm is None:
+        table = pq.read_table(path, columns=["item_id", "geo_sid"])
+    else:
+        pf = pq.ParquetFile(path)
+        total_bytes = os.path.getsize(path)
+        tables = []
+        with tqdm(total=total_bytes, unit="B", unit_scale=True,
+                  desc="读取 item map") as bar:
+            for i in range(pf.num_row_groups):
+                rg = pf.read_row_group(i, columns=["item_id", "geo_sid"])
+                tables.append(rg)
+                rg_meta = pf.metadata.row_group(i)
+                bar.update(sum(rg_meta.column(j).total_compressed_size
+                              for j in range(rg_meta.num_columns)))
+            bar.n = total_bytes
+            bar.refresh()
+        table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
     ids = table.column("item_id").to_pylist()
     sids = table.column("geo_sid").to_pylist()
     id2sid = {}
