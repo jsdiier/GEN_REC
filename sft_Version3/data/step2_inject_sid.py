@@ -64,30 +64,32 @@ def get_item_map_path(conf_path: str) -> str:
     return cp.get("item_map", "item_map_path")
 
 
+def _read_parquet_with_progress(path: str, columns: list, desc: str):
+    """带 tqdm 字节进度条的 parquet 读取（千万行级大表用）：逐 row group 读，
+       按压缩字节数推进（比按行数准，行数对应的实际 I/O 量因列压缩率而不均匀）；
+       未装 tqdm 时静默降级为无进度条的整表读取，功能不受影响。"""
+    if tqdm is None:
+        return pq.read_table(path, columns=columns)
+    pf = pq.ParquetFile(path)
+    total_bytes = os.path.getsize(path)
+    tables = []
+    with tqdm(total=total_bytes, unit="B", unit_scale=True, desc=desc) as bar:
+        for i in range(pf.num_row_groups):
+            rg = pf.read_row_group(i, columns=columns)
+            tables.append(rg)
+            rg_meta = pf.metadata.row_group(i)
+            bar.update(sum(rg_meta.column(j).total_compressed_size
+                          for j in range(rg_meta.num_columns)))
+        bar.n = total_bytes
+        bar.refresh()
+    return pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+
+
 def load_item_sid_map(path: str) -> dict:
-    """加载 item_id -> geo_sid 映射（只读两列，item_id 统一转成 str 作 key）。
-       item map 常是千万行级大表，逐 row group 读 + tqdm 按压缩字节数出进度条
-       （比按行数准，行数对应的实际 I/O 量因列压缩率而不均匀）；未装 tqdm 时
-       静默降级为无进度条的整表读取，功能不受影响。"""
+    """加载 item_id -> geo_sid 映射（只读两列，item_id 统一转成 str 作 key）。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"映射表不存在: {path}")
-    if tqdm is None:
-        table = pq.read_table(path, columns=["item_id", "geo_sid"])
-    else:
-        pf = pq.ParquetFile(path)
-        total_bytes = os.path.getsize(path)
-        tables = []
-        with tqdm(total=total_bytes, unit="B", unit_scale=True,
-                  desc="读取 item map") as bar:
-            for i in range(pf.num_row_groups):
-                rg = pf.read_row_group(i, columns=["item_id", "geo_sid"])
-                tables.append(rg)
-                rg_meta = pf.metadata.row_group(i)
-                bar.update(sum(rg_meta.column(j).total_compressed_size
-                              for j in range(rg_meta.num_columns)))
-            bar.n = total_bytes
-            bar.refresh()
-        table = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    table = _read_parquet_with_progress(path, ["item_id", "geo_sid"], "读取 item map")
     ids = table.column("item_id").to_pylist()
     sids = table.column("geo_sid").to_pylist()
     id2sid = {}
@@ -96,6 +98,28 @@ def load_item_sid_map(path: str) -> dict:
             continue
         id2sid[str(i)] = s
     return id2sid
+
+
+def load_item_sid_shop_map(path: str) -> tuple:
+    """item_id -> (geo_sid, shop_id) 双映射，一次 parquet 读取同时拿到两列
+       （inference 的 item_result 需要 shop_id；仅供 inference 使用，
+       train/eval 仍走 load_item_sid_map，读取行为不变）。
+       shop_id 缺失的行给 None。返回 (id2sid, id2shop)。"""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"映射表不存在: {path}")
+    table = _read_parquet_with_progress(
+        path, ["item_id", "geo_sid", "shop_id"], "读取 item map(含shop_id)")
+    ids = table.column("item_id").to_pylist()
+    sids = table.column("geo_sid").to_pylist()
+    shops = table.column("shop_id").to_pylist()
+    id2sid, id2shop = {}, {}
+    for i, s, sh in zip(ids, sids, shops):
+        if i is None:
+            continue
+        key = str(i)
+        id2sid[key] = s
+        id2shop[key] = str(sh) if sh is not None else None
+    return id2sid, id2shop
 
 
 # ------------------------------------------------------------------

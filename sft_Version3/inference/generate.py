@@ -15,10 +15,19 @@ search 第 0 层（geohash）的候选根限定为"该收藏坐标 radius_km 邻
 真实存在的 geohash 集合"——用户具体会落在哪个 geohash 仍由模型在这个子集里自己
 选，只是圈定了地理范围；每用户按 user_favor_coor_top3 字段解析出的收藏坐标
 （geohash 去重）与 periods 组合，各出一份缓存。
-每条推理的粒度 = uid x 收藏坐标圆心 geohash x period（缓存键
-uid_<圆心geohash>_<cache_version_tag>_<period>）；输出按行为分文件
-rec_{行为}.parquet，period/coord_rank/圆心geohash/合法geohash白名单等作为列
-区分（不再按 period/坐标拆文件）。
+每条推理的粒度 = uid x 收藏坐标圆心 geohash x period（缓存键 cache_key =
+uid_<圆心geohash>_<cache_version_tag>_<period>）。两个输出文件按行为分文件，
+以 cache_key 一一对应（jsonl 是 cache_key 粒度，parquet 是 cache_key x rank
+粒度）：
+  - rec_{行为}.parquet：仅 cache_key/rank/score/sid/item_ids/shop_id 六列
+    （精简为下游直接消费的推荐负载，period/坐标等上下文字段不落 parquet）；
+  - debug_{行为}.jsonl：uid/target_behavior/period/coord_rank/圆心geohash/
+    lng/lat/legal_geohashes(合法白名单)/cache_key + item_result（该 cache_key
+    下 top-K 涉及的全部真实 item：[{item_id, shop_id, geo_sid}, ...]）+
+    history(解码后的模型输入)/prompt_tokens。
+[inference] max_output_caches 只限制 debug_{行为}.jsonl 落盘前 N 个 cache_key
+（供人工抽样核对，不影响 beam search 计算/排序）；rec_{行为}.parquet 永远是
+本次推理的全部结果，不受这个开关影响。
 
 流程：
   1. 读 common.conf [inference]（窗口/上限/行为/topk/beam/ckpt/输出目录）
@@ -99,6 +108,8 @@ def load_infer_config(conf_path: str) -> dict:
                                     fallback="Version3"),
         "write_debug_input": cp.getboolean("inference", "write_debug_input",
                                           fallback=True),
+        "max_output_caches": cp.getint("inference", "max_output_caches",
+                                       fallback=-1),
     }
 
 
@@ -142,38 +153,36 @@ def iter_infer_users_with_coords(conf_path: str, ic: dict, id2sid: dict):
 # ------------------------------------------------------------------
 class ParquetRecWriter:
     """流式 parquet 写入：每条推荐一行，攒满 buffer_rows 写一个 row group，
-       不整窗攒内存。用完必须 close()。一个文件混装多个 (period, coord) 组合，
-       靠 period/coord_rank/geohash 等列区分。"""
+       不整窗攒内存。用完必须 close()。一个文件混装多个 cache_key（uid x 圆心
+       geohash x period）的推荐，只靠 cache_key 区分——period/coord_rank/圆心
+       geohash/白名单等上下文字段不落 parquet（要看这些去 debug_{行为}.jsonl，
+       同一 cache_key 在两个文件里一一对应）。"""
     SCHEMA = pa.schema([
-        ("uid", pa.string()),
-        ("period", pa.string()),
-        ("coord_rank", pa.int32()),           # 该用户收藏坐标去重后的序号（0 起）
-        ("geohash", pa.string()),             # 收藏坐标中心点(圆心)的 geohash（缓存键用）
-        ("lng", pa.float64()),
-        ("lat", pa.float64()),
-        ("legal_geohashes", pa.list_(pa.string())),  # 圆心 radius_km 邻域内的合法 geohash 白名单
         ("cache_key", pa.string()),           # uid_<圆心geohash>_<version>_<period>
         ("rank", pa.int32()),                 # 1 = 置信最高
-        ("sid", pa.string()),                 # 模型实际生成的 SID（其 geohash 未必等于圆心）
         ("score", pa.float32()),              # 各 SID token 的累计 logprob
+        ("sid", pa.string()),                 # 模型实际生成的 SID（其 geohash 未必等于圆心）
         ("item_ids", pa.list_(pa.string())),  # sid 反查（一对多）
+        ("shop_id", pa.list_(pa.string())),   # 与 item_ids 逐一对应的店铺 id
     ])
 
-    def __init__(self, path: str, sid2items: dict, topk: int,
+    def __init__(self, path: str, sid2items: dict, id2shop: dict, topk: int,
                  buffer_rows: int = 50000):
         self.sid2items = sid2items
+        self.id2shop = id2shop
         self.topk = topk
         self.buffer_rows = buffer_rows
         self.writer = pq.ParquetWriter(path, self.SCHEMA)
         self.buf = []
 
-    def write_user(self, uid, beams, extra: dict = None):
+    def write_user(self, cache_key: str, beams):
         for rank, (sid, score) in enumerate(beams[:self.topk], start=1):
-            row = {"uid": str(uid), "rank": rank, "sid": sid, "score": float(score),
-                  "item_ids": [str(x) for x in self.sid2items.get(sid, [])]}
-            if extra:
-                row.update(extra)
-            self.buf.append(row)
+            item_ids = [str(x) for x in self.sid2items.get(sid, [])]
+            self.buf.append({
+                "cache_key": cache_key, "rank": rank, "score": float(score),
+                "sid": sid, "item_ids": item_ids,
+                "shop_id": [self.id2shop.get(x) for x in item_ids],
+            })
         if len(self.buf) >= self.buffer_rows:
             self._flush()
 
@@ -209,11 +218,24 @@ def _decode_history(tok, prefix: dict) -> list:
     return [list(t) for t in tok.decode(prefix["input_ids"])]
 
 
+def _build_item_result(beams, topk: int, sid2items: dict, id2shop: dict) -> list:
+    """该 cache_key 下 top-K 涉及的全部真实 item 清单（跨所有 rank 展平，
+       与 parquet 落盘的 rank 范围一致）：[{item_id, shop_id, geo_sid}, ...]。
+       geo_sid = 该 item 所属 rank 的 sid（一个 sid 下的所有 item 共享同一 geo_sid）。"""
+    out = []
+    for sid, _score in beams[:topk]:
+        for item_id in sid2items.get(sid, []):
+            out.append({"item_id": item_id, "shop_id": id2shop.get(item_id),
+                       "geo_sid": sid})
+    return out
+
+
 # ------------------------------------------------------------------
 # 推理主体（与数据源解耦，便于单测）
 # ------------------------------------------------------------------
 def generate_for_users(model, tok, trie, user_iter, ic: dict,
                        device, autocast_ctx, writers: dict,
+                       sid2items: dict, id2shop: dict,
                        debug_writers: dict = None) -> dict:
     """收藏坐标邻域约束缓存：每用户按 (behavior x period x 收藏坐标去重后的
        geohash) 生成一份 top-K，第一层 geohash 候选被限定在该坐标 radius_km 内、
@@ -221,11 +243,16 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
        geohash 仍由模型选）。writers 以 behavior 为键（一行为一文件）；返回同
        结构统计 {behavior: {"n": 覆盖次数, "infer_s": 纯推理秒, "skipped": 空邻域跳过数}}。
        debug_writers（可选，同以 behavior 为键）：写入解码后的模型输入 + 合法
-       geohash 白名单，供人工核对。"""
+       geohash 白名单 + item_result（该 cache_key 下全部真实 item 明细），
+       供人工核对；ic["max_output_caches"]>0 时只对 debug_writers 落盘前 N 个
+       cache_key（writers/parquet 不受影响，永远是全部结果；beam search 本身
+       的计算/排序也不受影响，只是少写一份调试记录）。"""
     precision = geo.geohash_precision_from_vocab(tok)
     real_geohashes = {tok.id2token[tid][1:-1] for tid in trie.keys()}
     periods = ic["periods_resolved"]
+    max_caches = ic.get("max_output_caches", -1)
     stats = {b: {"n": 0, "infer_s": 0.0, "skipped": 0} for b in ic["behaviors"]}
+    written = {b: 0 for b in ic["behaviors"]}
 
     def resolve_coords(raw):
         """收藏坐标原始字段 -> 去重后的 (rank, lng, lat, geohash, legal_list, root)
@@ -276,10 +303,13 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
                 stats[behavior]["infer_s"] += time.time() - t0
                 stats[behavior]["n"] += len(rows)
                 for (uid, prefix, root, extra), beams in zip(rows, results):
-                    writers[behavior].write_user(uid, beams, extra=extra)
-                    if debug_writers:
+                    writers[behavior].write_user(extra["cache_key"], beams)
+                    if debug_writers and (max_caches < 0 or written[behavior] < max_caches):
+                        written[behavior] += 1
                         debug_writers[behavior].write({
                             "uid": uid, "target_behavior": behavior, **extra,
+                            "item_result": _build_item_result(
+                                beams, ic["topk"], sid2items, id2shop),
                             "history": _decode_history(tok, prefix),
                             "prompt_tokens": len(prefix["input_ids"]),
                         })
@@ -340,7 +370,8 @@ def main():
           f"val_loss={meta['val_loss']:.4f})")
 
     import step3_build_samples as step3
-    id2sid = step3.load_item_sid_map(step3.get_item_map_path(conf_path))
+    from step2_inject_sid import load_item_sid_shop_map
+    id2sid, id2shop = load_item_sid_shop_map(step3.get_item_map_path(conf_path))
     sid2items = defaultdict(list)             # 反查：一个 SID 可对应多个 item
     for item_id, sid in id2sid.items():
         sid2items[sid].append(item_id)
@@ -352,14 +383,16 @@ def main():
     t_start = time.time()
 
     paths = {b: os.path.join(run_dir, f"rec_{b}.parquet") for b in ic["behaviors"]}
-    writers = {b: ParquetRecWriter(p, sid2items, ic["topk"]) for b, p in paths.items()}
+    writers = {b: ParquetRecWriter(p, sid2items, id2shop, ic["topk"])
+              for b, p in paths.items()}
     debug_paths = {b: os.path.join(run_dir, f"debug_{b}.jsonl")
                   for b in ic["behaviors"]} if ic["write_debug_input"] else {}
     debug_writers = {b: DebugJsonlWriter(p) for b, p in debug_paths.items()}
     try:
         stats = generate_for_users(
             model, tok, trie, iter_infer_users_with_coords(conf_path, ic, id2sid),
-            ic, device, autocast_ctx, writers, debug_writers=debug_writers or None)
+            ic, device, autocast_ctx, writers, sid2items, id2shop,
+            debug_writers=debug_writers or None)
     finally:
         for w in writers.values():
             w.close()
