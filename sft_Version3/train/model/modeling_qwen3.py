@@ -34,6 +34,11 @@ class Qwen3NTPConfig:
     qwen3_path: str                        # 本地预训练权重目录（HF 格式）
     pad_token_id: int = 0
     max_position_embeddings: int = 1024    # 仅需 <= Qwen3 原生 rope 支持长度（32768）
+    # Qwen3-0.6B 官方 config 是 28 层、hidden=1024，比 GAMER 的 8 层大很多，不开
+    # 梯度检查点 batch_size 稍大一点就 OOM（forward 激活值是主要显存开销，不是
+    # attention 矩阵本身——sdpa 已经不物化 (B,H,L,L)）；反正只是拿 activation
+    # 换算力，重算一遍前向的开销远小于省下的显存，没有理由关。
+    gradient_checkpointing: bool = True
 
 
 class Qwen3NTPModel(nn.Module):
@@ -44,15 +49,18 @@ class Qwen3NTPModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         if load_pretrained:
-            full = Qwen3ForCausalLM.from_pretrained(cfg.qwen3_path)
+            full = Qwen3ForCausalLM.from_pretrained(cfg.qwen3_path, attn_implementation="sdpa")
         else:
             hf_cfg = HFQwen3Config.from_pretrained(cfg.qwen3_path)
-            full = Qwen3ForCausalLM(hf_cfg)
+            full = Qwen3ForCausalLM(hf_cfg, attn_implementation="sdpa")
         full.resize_token_embeddings(cfg.vocab_size)   # 换成 SID 小词表，embedding+lm_head 同步 resize
         full.config.pad_token_id = cfg.pad_token_id
+        full.config.use_cache = False
         self.backbone = full.model      # Qwen3Model：embedding + N 层 + 末尾 RMSNorm（无 lm_head）
         self.lm_head = full.lm_head
         self.hf_config = full.config
+        if cfg.gradient_checkpointing:
+            self.backbone.gradient_checkpointing_enable()
 
     def forward(self, input_ids, behavior_ids=None, token_types=None,
                 attention_mask=None, labels=None, last_positions=None):
