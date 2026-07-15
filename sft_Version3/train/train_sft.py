@@ -93,6 +93,7 @@ def load_train_config(conf_path: str) -> dict:
         "wandb_project": cp.get("train", "wandb_project", fallback="").strip(),
         "wandb_run_name": cp.get("train", "wandb_run_name", fallback="").strip(),
         "wandb_api_key": cp.get("train", "wandb_api_key", fallback="").strip(),
+        "wandb_init_retries": cp.getint("train", "wandb_init_retries", fallback=3),
         "resume_from": (lambda v: "" if not v else path("resume_from", v))(
             cp.get("train", "resume_from", fallback="").strip()),
     }
@@ -101,7 +102,9 @@ def load_train_config(conf_path: str) -> dict:
 def init_wandb(tc: dict, model_cfg) -> "object":
     """wandb_project 配置了才开启；wandb 未安装或未登录时降级为警告，不阻塞训练。
        API key 优先读 conf 的 wandb_api_key（本地/平台容器通用），
-       留空则回退 WANDB_API_KEY 环境变量 / ~/.netrc（wandb login）。"""
+       留空则回退 WANDB_API_KEY 环境变量 / ~/.netrc（wandb login）。
+       平台节点出网情况不稳定，wandb.init() 偶发 ConnectTimeout；失败按
+       wandb_init_retries 重试几次（间隔 5s），重试次数用完才放弃监控。"""
     if not tc["wandb_project"]:
         return None
     if tc["wandb_api_key"]:
@@ -111,19 +114,24 @@ def init_wandb(tc: dict, model_cfg) -> "object":
     except ImportError:
         print("[WARN] wandb 未安装（pip install wandb），跳过监控")
         return None
-    try:
-        run = wandb.init(
-            project=tc["wandb_project"],
-            name=tc["wandb_run_name"] or
-            f"gamer-{tc['data_mode']}-{time.strftime('%m%d-%H%M')}",
-            config={**{k: v for k, v in tc.items() if not k.startswith("wandb")},
-                    "model": asdict(model_cfg)},
-        )
-        print(f"[INFO] wandb 已开启: {run.url}")
-        return run
-    except Exception as e:                      # 未登录 / 网络不通等
-        print(f"[WARN] wandb 初始化失败，跳过监控: {e}")
-        return None
+    retries = max(tc["wandb_init_retries"], 1)
+    for attempt in range(1, retries + 1):
+        try:
+            run = wandb.init(
+                project=tc["wandb_project"],
+                name=tc["wandb_run_name"] or
+                f"gamer-{tc['data_mode']}-{time.strftime('%m%d-%H%M')}",
+                config={**{k: v for k, v in tc.items() if not k.startswith("wandb")},
+                        "model": asdict(model_cfg)},
+            )
+            print(f"[INFO] wandb 已开启: {run.url}")
+            return run
+        except Exception as e:                      # 未登录 / 网络不通等
+            print(f"[WARN] wandb 初始化第 {attempt}/{retries} 次失败: {e}")
+            if attempt < retries:
+                time.sleep(5)
+    print(f"[WARN] wandb 初始化重试 {retries} 次均失败，跳过监控")
+    return None
 
 
 # stream 模式 epoch 1 校准前的临时 warmup 步数（升到峰值 lr 后平顶等待校准）
