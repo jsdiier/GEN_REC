@@ -10,7 +10,11 @@ train_sft: GAMER 从零训练循环（对齐论文 4.1.4 的训练配置）。
        stream: GAMERStreamingTrainDataset 在 DataLoader worker 内直连 HDFS
                流式生成（TB 级不落盘）；val 启动时抽样收集一次常驻内存；
                lr 调度总步数 epoch 1 结束后按实测步数自动校准（见 build_scheduler）；
-  3. GAMERModel（配置由 tokenizer 推导：vocab_size / tokens_per_item / behavior_levels）；
+  3. build_model() 按 [train] model_type 二选一（配置由 tokenizer 推导：vocab_size /
+     tokens_per_item / behavior_levels 等）：
+       gamer : 论文对齐的手写 8 层 GAMERModel，从零训练；
+       qwen3 : 原生 Qwen3 结构（transformers 库）做 backbone，从 qwen3_path 的预训练
+               权重初始化，只替换词表（modeling_qwen3.py）；
   4. AdamW + 线性 warmup(4%) + 余弦衰减到 min_lr；
   5. 逐 epoch：train 全 token 监督 NTP；val（teacher-forcing，只算 label 区，按有效
      token 数加权聚合）在每个 epoch 末必跑，eval_every>0 时每隔该步数再加跑一次
@@ -19,9 +23,10 @@ train_sft: GAMER 从零训练循环（对齐论文 4.1.4 的训练配置）。
   6. patience>0 时按 val loss 早停；否则训满 epochs（论文做法，最终用 best.pt）。
 
 说明：
-  - 模型仅 ~40M，单卡即可，不需要 deepspeed/ZeRO；CUDA 下自动用 bf16 autocast；
-  - checkpoint 含 model state_dict + GAMERConfig 字段 + epoch/val_loss，
-    推理端用 load_checkpoint() 还原。
+  - GAMERModel 仅 ~40M，单卡即可；qwen3 model_type 参数量取决于 qwen3_path 的权重
+    （官方 Qwen3-0.6B 是 28 层）；CUDA 下自动用 bf16 autocast；
+  - checkpoint 含 model state_dict + config 字段 + model_type + epoch/val_loss，
+    推理端用 load_checkpoint() 按 model_type 还原对应结构。
 
 用法:
     python train_sft.py [common.conf]
@@ -42,6 +47,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mod
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tokenizer_sid import SIDTokenizer            # noqa: E402
 from modeling import GAMERConfig, GAMERModel      # noqa: E402
+from modeling_qwen3 import Qwen3NTPConfig, Qwen3NTPModel  # noqa: E402
 from dataset import GAMERJsonlDataset, GAMERCollator  # noqa: E402
 
 
@@ -59,6 +65,11 @@ def load_train_config(conf_path: str) -> dict:
         return p if os.path.isabs(p) else os.path.join(root, p)
 
     return {
+        "model_type": cp.get("train", "model_type", fallback="gamer").strip(),
+        # 支持相对路径（相对 common.conf 所在目录，即每次训练的启动根目录）；
+        # 留空（gamer 场景）不做拼接，保持空字符串
+        "qwen3_path": (lambda v: "" if not v else path("qwen3_path", v))(
+            cp.get("train", "qwen3_path", fallback="").strip()),
         "data_mode": cp.get("train", "data_mode", fallback="jsonl"),
         "shuffle_buffer": cp.getint("train", "shuffle_buffer", fallback=10000),
         "val_sample_rate": cp.getfloat("train", "val_sample_rate", fallback=0.05),
@@ -214,13 +225,41 @@ def evaluate(model, val_dl, device, autocast_ctx, slot_defs=None):
     return total_loss / max(total_tokens, 1), per_slot
 
 
-def save_checkpoint(path: str, model, cfg: GAMERConfig, epoch: int, val_loss: float,
+def build_model(model_type: str, tok, tc: dict):
+    """按 [train] model_type 二选一构造模型：
+       gamer  -> 论文对齐的手写 8 层 GAMERModel，从零训练；
+       qwen3  -> 原生 Qwen3 结构（transformers 库）做 backbone，从 qwen3_path 的
+                 预训练权重初始化，只替换词表（resize 到 SID 小词表）。"""
+    if model_type == "qwen3":
+        cfg = Qwen3NTPConfig(vocab_size=tok.vocab_size,
+                             qwen3_path=tc["qwen3_path"],
+                             pad_token_id=tok.pad_id,
+                             max_position_embeddings=tc["max_len"])
+        model = Qwen3NTPModel(cfg)
+    elif model_type == "gamer":
+        cfg = GAMERConfig(vocab_size=tok.vocab_size,
+                          tokens_per_item=tok.num_levels,
+                          num_behaviors=len(tok.behaviors),
+                          num_periods=len(getattr(tok, "periods", [])),
+                          behavior_levels=tok.behavior_levels,
+                          max_position_embeddings=tc["max_len"],
+                          pad_token_id=tok.pad_id)
+        model = GAMERModel(cfg)
+    else:
+        raise ValueError(f"未知 model_type: {model_type}（支持 gamer / qwen3）")
+    return model, cfg
+
+
+def save_checkpoint(path: str, model, cfg, model_type: str, epoch: int, val_loss: float,
                     extra: dict = None):
     """best.pt 只存权重（推理用，体积小）；last.pt 由调用方传 extra
-       （optimizer/scheduler/global_step 等）支持断点续训。"""
+       （optimizer/scheduler/global_step 等）支持断点续训。
+       model_type 随 checkpoint 落盘，load_checkpoint 据此还原对应模型结构，
+       不依赖加载时 common.conf 恰好是哪个配置。"""
     d = {
         "model": model.state_dict(),
         "config": asdict(cfg),
+        "model_type": model_type,
         "epoch": epoch,
         "val_loss": val_loss,
     }
@@ -232,10 +271,17 @@ def save_checkpoint(path: str, model, cfg: GAMERConfig, epoch: int, val_loss: fl
 def load_checkpoint(path: str, map_location="cpu"):
     """推理端还原：返回 (model, config, meta)。"""
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    model_type = ckpt.get("model_type", "gamer")   # 旧 checkpoint 没有这个字段，默认 gamer
     cfg_d = dict(ckpt["config"])
-    cfg_d["behavior_levels"] = tuple(cfg_d["behavior_levels"])
-    cfg = GAMERConfig(**cfg_d)
-    model = GAMERModel(cfg)
+    if model_type == "qwen3":
+        cfg = Qwen3NTPConfig(**cfg_d)
+        # load_pretrained=False：只按 qwen3_path 的 config.json 建架构、随机初始化，
+        # 马上被下面的 load_state_dict 整体覆盖，加载真实预训练权重纯属浪费 I/O。
+        model = Qwen3NTPModel(cfg, load_pretrained=False)
+    else:
+        cfg_d["behavior_levels"] = tuple(cfg_d["behavior_levels"])
+        cfg = GAMERConfig(**cfg_d)
+        model = GAMERModel(cfg)
     model.load_state_dict(ckpt["model"])
     return model, cfg, {"epoch": ckpt["epoch"], "val_loss": ckpt["val_loss"]}
 
@@ -294,16 +340,10 @@ def main():
                         collate_fn=coll, num_workers=0,
                         pin_memory=(device == "cuda"))
 
-    # 模型（结构参数由 tokenizer 推导）
-    cfg = GAMERConfig(vocab_size=tok.vocab_size,
-                      tokens_per_item=tok.num_levels,
-                      num_behaviors=len(tok.behaviors),
-                      num_periods=len(getattr(tok, "periods", [])),
-                      behavior_levels=tok.behavior_levels,
-                      max_position_embeddings=tc["max_len"],
-                      pad_token_id=tok.pad_id)
-    model = GAMERModel(cfg).to(device)
-    print(f"[INFO] 模型参数量: {model.num_parameters() / 1e6:.2f}M")
+    # 模型：[train] model_type 二选一（gamer=从零训练手写模型 / qwen3=Qwen3 预训练 backbone）
+    model, cfg = build_model(tc["model_type"], tok, tc)
+    model = model.to(device)
+    print(f"[INFO] model_type={tc['model_type']}  模型参数量: {model.num_parameters() / 1e6:.2f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"],
                                   weight_decay=tc["weight_decay"])
@@ -325,6 +365,10 @@ def main():
         if not ckpt_file.endswith(".pt"):
             ckpt_file = os.path.join(ckpt_file, "last.pt")
         ck = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        ck_model_type = ck.get("model_type", "gamer")
+        if ck_model_type != tc["model_type"]:
+            raise ValueError(f"续训 checkpoint 的 model_type={ck_model_type} 与当前 "
+                             f"common.conf 的 model_type={tc['model_type']} 不一致")
         model.load_state_dict(ck["model"])
         start_epoch = ck["epoch"] + 1
         best_val = ck.get("best_val", ck["val_loss"])
@@ -378,7 +422,8 @@ def main():
         improved = vl < best_val
         if improved:
             best_val, best_epoch = vl, epoch
-            save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, epoch, vl)
+            save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg,
+                            tc["model_type"], epoch, vl)
         if wb:
             log = {"val/loss": vl, "val/best_loss": best_val, "epoch": epoch}
             for name, (sl, sm) in per_slot.items():
@@ -449,7 +494,7 @@ def main():
                             f"train_loss={train_loss:.4f} ({time.time() - t0:.1f}s)")
         bad_epochs = 0 if best_val < best_before else bad_epochs + 1
         save_checkpoint(os.path.join(run_dir, "last.pt"),
-                        model, cfg, epoch, val_loss,
+                        model, cfg, tc["model_type"], epoch, val_loss,
                         extra={"optimizer": optimizer.state_dict(),
                                "sched_last_epoch": scheduler.last_epoch,
                                "sched_calib": scheduler.export_state(),
