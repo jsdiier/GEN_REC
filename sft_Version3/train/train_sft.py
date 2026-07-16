@@ -242,7 +242,11 @@ def build_model(model_type: str, tok, tc: dict):
         cfg = Qwen3NTPConfig(vocab_size=tok.vocab_size,
                              qwen3_path=tc["qwen3_path"],
                              pad_token_id=tok.pad_id,
-                             max_position_embeddings=tc["max_len"])
+                             max_position_embeddings=tc["max_len"],
+                             tokens_per_item=tok.num_levels,
+                             num_behaviors=len(tok.behaviors),
+                             num_periods=len(getattr(tok, "periods", [])),
+                             behavior_levels=tok.behavior_levels)
         model = Qwen3NTPModel(cfg)
     elif model_type == "gamer":
         cfg = GAMERConfig(vocab_size=tok.vocab_size,
