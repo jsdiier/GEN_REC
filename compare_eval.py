@@ -3,7 +3,7 @@
 """
 compare_eval.py
 读各实验 outputs/predictions/pred_{clk,pay}.jsonl，重算指标并对比展示
-（渲染风格对齐 tf_rank/ana_result.py：fancy_grid + baseline/new + 千分位 delta）
+（渲染风格对齐 tf_rank/ana_result.py：fancy_grid + baseline/new + 百分位 delta）
 
 用法:
     python3 compare_eval.py <exp>                      # 单实验：展示其 clk/pay 指标
@@ -18,7 +18,7 @@ compare_eval.py
   - 指标从预测明细现算（HR/Recall/NDCG@K + 分层前缀命中率），与 run_eval 报表同口径；
   - 分层前缀命中: depth j 命中 = top-K 内存在与任一 label 前 j 层 SID 一致的预测，
     层数按各实验数据自动识别（基线 4 层 / tiger 5 层），缺的层显示 N/A；
-  - delta = (new - baseline) * 1000，千分位绝对提升；
+  - delta = (new - baseline) * 100，百分位绝对提升（百分点）；
   - 口径注意: 两实验「精确命中」粒度可能不同（4层=共享SID，5层=精确item），
     同粒度对比看两边都有的前缀层（如 L4）；热门基线不在明细里，见各自 eval 日志。
 """
@@ -151,9 +151,9 @@ def behavior_qps(meta: dict, behavior: str) -> dict:
 
 
 def format_delta(delta: float) -> str:
-    """千分位绝对提升，如 +2.092‰ / -1.500‰"""
+    """百分位绝对提升（百分点），如 +2.020% / -0.150%"""
     sign = "+" if delta >= 0 else ""
-    return f"{sign}{delta:.3f}‰"
+    return f"{sign}{delta:.3f}%"
 
 
 def depth_name(tags: list, j: int) -> str:
@@ -184,7 +184,7 @@ def print_behavior(behavior: str, ks: list, results: dict):
             vals = [results[e]["metrics"][k][key] for e in exps]
             row = [f"{label}@{k}"] + [f"{v:.4f}" for v in vals]
             if pair:
-                row.append(format_delta((vals[1] - vals[0]) * 1000))
+                row.append(format_delta((vals[1] - vals[0]) * 100))
             rows.append(row)
     print(tabulate(rows, headers=[behavior.upper()] + cols,
                    tablefmt="fancy_grid", stralign="center",
@@ -200,7 +200,7 @@ def print_behavior(behavior: str, ks: list, results: dict):
             row = [f"{depth_name(tags, j)} @{k}"] + \
                   [f"{v:.4f}" if v is not None else "N/A" for v in vals]
             if pair:
-                row.append(format_delta((vals[1] - vals[0]) * 1000)
+                row.append(format_delta((vals[1] - vals[0]) * 100)
                            if None not in vals else "—")
             rows2.append(row)
     print(tabulate(rows2, headers=["前缀命中(方向诊断)"] + cols,
