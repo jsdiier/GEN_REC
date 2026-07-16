@@ -1,16 +1,40 @@
 #!/bin/bash
-# 独立 test 窗口评测：约束 beam search 推理 + HR/Recall/NDCG 报表（clk/pay 分开）。
+# 独立 test 窗口评测统一入口：按 common.conf [eval] launch_mode 分发。
+#   local    -> 当前机器直接跑 run_eval.py
+#   platform -> submit_eval.py 提交 Luban 平台并轮询到结束
 # 前置：outputs/ckpt/best.pt（train_sft）与 outputs/vocab.json（tokenizer_sid）已生成，
 #       common.conf [data] test_start/test_end/test_sample_rate 与 [eval] 已配置。
 # 用法: bash run_eval.sh [common.conf]
 #   不传参时默认用项目根目录的 common.conf
+#   （平台任务本身执行的是 eval_platform.sh -> run_eval.py，不会再读
+#     launch_mode，不存在递归提交）
 set -e
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_FILE="${1:-${SCRIPT_DIR}/../common.conf}"
-echo ">>> conf_file=${CONF_FILE}"
-echo ">>> python=$(which python)"
 
-cd "${SCRIPT_DIR}"
-python run_eval.py "${CONF_FILE}"
+MODE=$(python3 - "${CONF_FILE}" <<'PY'
+import configparser, sys
+cp = configparser.ConfigParser()
+cp.read(sys.argv[1], encoding="utf-8")
+print(cp.get("eval", "launch_mode", fallback="local").strip() or "local")
+PY
+)
+echo ">>> conf_file=${CONF_FILE}"
+echo ">>> launch_mode=${MODE}"
+
+case "${MODE}" in
+  local)
+    echo ">>> python=$(which python)"
+    cd "${SCRIPT_DIR}"
+    exec python run_eval.py "${CONF_FILE}"
+    ;;
+  platform)
+    exec python3 "${SCRIPT_DIR}/submit_eval.py" "${CONF_FILE}"
+    ;;
+  *)
+    echo "[ERROR] 未知 launch_mode: ${MODE}（支持 local / platform）" >&2
+    exit 1
+    ;;
+esac
