@@ -97,6 +97,12 @@ def load_config(conf_path: str) -> dict:
                        cp.get("data", "seq_fields",
                               fallback="u_pay_item_seq_100").split(",")
                        if s.strip()],
+        # 用户收藏坐标原始字段（test 样本 favor_coord_raw 用）：[data] 没配就复用
+        # [inference] 已有的同名配置，两处语义一致，不强制重复填一遍
+        "favor_coord_field": cp.get(
+            "data", "favor_coord_field",
+            fallback=cp.get("inference", "favor_coord_field",
+                            fallback="user_favor_coor_top3")),
     }
 
 

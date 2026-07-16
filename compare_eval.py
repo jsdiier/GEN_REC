@@ -26,6 +26,7 @@ compare_eval.py
 import os
 import json
 import math
+import glob
 import argparse
 
 from tabulate import tabulate
@@ -71,38 +72,47 @@ def user_prefix(ranked: list, labels: list, ks: list, L: int) -> dict:
                     for k in ks} for j in range(L)}
 
 
-def load_behavior(path: str, ks: list) -> dict:
-    """聚合一个 pred_{behavior}.jsonl -> 平均指标。返回 None 表示文件缺失/为空。"""
-    if not os.path.isfile(path):
+def load_behavior(exp_dir: str, pred_dir: str, behavior: str, ks: list) -> dict:
+    """聚合一个行为下【全部分组】的预测明细 -> 微平均指标（run_eval.py 现在按
+       (行为,时段) 分组落盘，文件名是 pred_{behavior}.jsonl（无时段词表退化态）
+       或 pred_{behavior}_{period}.jsonl（如 pred_pay_bf.jsonl），这里 glob 全部
+       匹配上的文件，所有组的评测实例直接池到一起算——跟 run_eval.py 报表里
+       "跨时段组微平均" 同一个口径，不是先各组求平均再平均。
+       返回 None 表示一个文件都没找到/全为空。"""
+    base = os.path.join(exp_dir, pred_dir)
+    paths = sorted(set(glob.glob(os.path.join(base, f"pred_{behavior}.jsonl")) +
+                       glob.glob(os.path.join(base, f"pred_{behavior}_*.jsonl"))))
+    if not paths:
         return None
     n, n_labels, L, level_tags = 0, 0, None, None
     sums = {k: {"hr": 0.0, "recall": 0.0, "ndcg": 0.0} for k in ks}
     pfx_sums, max_stored = None, None
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            ranked = [sid for sid, _ in r["topk"]]
-            labels = r["labels"]
-            if not labels:
-                continue
-            if L is None:
-                parts = sid_parts(labels[0])
-                L = len(parts)
-                level_tags = ["geo"] + [p.split("_")[0] for p in parts[1:]]
-                pfx_sums = {j: {k: 0.0 for k in ks} for j in range(1, L + 1)}
-                max_stored = len(ranked)
-            m = user_metrics(ranked, labels, ks)
-            p = user_prefix(ranked, labels, ks, L)
-            for k in ks:
-                for key, _ in METRIC_KEYS:
-                    sums[k][key] += m[k][key]
-                for j in range(1, L + 1):
-                    pfx_sums[j][k] += p[j][k]
-            n += 1
-            n_labels += len(labels)
+    for path in paths:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                ranked = [sid for sid, _ in r["topk"]]
+                labels = r["labels"]
+                if not labels:
+                    continue
+                if L is None:
+                    parts = sid_parts(labels[0])
+                    L = len(parts)
+                    level_tags = ["geo"] + [p.split("_")[0] for p in parts[1:]]
+                    pfx_sums = {j: {k: 0.0 for k in ks} for j in range(1, L + 1)}
+                    max_stored = len(ranked)
+                m = user_metrics(ranked, labels, ks)
+                p = user_prefix(ranked, labels, ks, L)
+                for k in ks:
+                    for key, _ in METRIC_KEYS:
+                        sums[k][key] += m[k][key]
+                    for j in range(1, L + 1):
+                        pfx_sums[j][k] += p[j][k]
+                n += 1
+                n_labels += len(labels)
     if n == 0:
         return None
     return {
@@ -192,10 +202,10 @@ def main():
         name = os.path.basename(exp_dir.rstrip("/"))
         print(f"[INFO] 实验 {name}: {exp_dir}")
         for b in BEHAVIORS:
-            path = os.path.join(exp_dir, args.pred_dir, f"pred_{b}.jsonl")
-            r = load_behavior(path, ks)
+            r = load_behavior(exp_dir, args.pred_dir, b, ks)
             if r is None:
-                print(f"  ⚠  {b}: 找不到或为空: {path}")
+                print(f"  ⚠  {b}: 找不到或为空: "
+                      f"{os.path.join(exp_dir, args.pred_dir, f'pred_{b}*.jsonl')}")
                 continue
             if max(ks) > r["max_stored"]:
                 print(f"  ⚠  {b}: 明细只存了 top{r['max_stored']}，"

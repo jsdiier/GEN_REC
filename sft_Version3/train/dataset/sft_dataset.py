@@ -7,7 +7,7 @@ GAMERJsonlDataset: 读 step3 落盘的 train.jsonl / val.jsonl（或直接传入
 
 - train 行: {uid, aug_r, token_seq: [(action, geo_sid), ...]}
   -> encode_train_record：[BOS]+全序列，labels=input_ids（全 token 监督）
-- val 行  : {uid, input: [...], label_tokens: [...], positives_by_action, label_date}
+- val 行  : {uid, input: [...], label_tokens: [...], positives_grouped, favor_coord_raw, label_date}
   -> encode_val_record：labels 仅 label 区有效（teacher-forcing 算 val loss）
 
 截断策略（对齐论文 user-level 最大长度约束，如 100 个交互 ≈ 1+100*5=501 token）：

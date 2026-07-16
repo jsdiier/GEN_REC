@@ -97,7 +97,8 @@ def load_eval_config(conf_path: str) -> dict:
 # ------------------------------------------------------------------
 def collect_test_samples(conf_path: str, ec: dict) -> tuple:
     """扫完整个 test 窗口，返回 (samples, stats, id2sid)，id2sid 复用给 trie。
-       sample: {uid, input: [(action, geo_sid)...], positives_by_action, label_date}。"""
+       sample: {uid, input: [(action, geo_sid)...], positives_grouped,
+                favor_coord_raw, label_date}。"""
     import step3_build_samples as step3
     from step1_get_user_action import load_config
 
@@ -125,8 +126,8 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
         samples.append({
             "uid": test["uid"],
             "input": step3._slim(test["input"]),
-            "positives_by_action": test["positives_by_action"],
-            "positives_by_action_period": test["positives_by_action_period"],
+            "positives_grouped": test["positives_grouped"],
+            "favor_coord_raw": test["favor_coord_raw"],
             "label_date": test["label_date"],
         })
         if 0 < ec["test_max_num"] <= len(samples):
@@ -139,11 +140,19 @@ def collect_test_samples(conf_path: str, ec: dict) -> tuple:
 # ------------------------------------------------------------------
 # 行为条件评测
 # ------------------------------------------------------------------
-def group_labels(s: dict, behavior: str, period: str):
-    """取一个 test 样本在 (行为[, 时段]) 组的正样本列表；无则返回 None。"""
-    if period is None:
-        return s["positives_by_action"].get(behavior)
-    return s.get("positives_by_action_period", {}).get(behavior, {}).get(period)
+def group_labels(s: dict, behavior: str, period: str = None):
+    """取一个 test 样本在 (时段, 行为) 组的正样本列表；无则返回 None。
+       positives_grouped 的 key 固定是 "{meal_period}_{action}"（meal_period 在
+       step3 无条件算出，跟词表有没有时段位无关）。词表没有时段位时
+       （period=None，没法在生成条件里指定时段）退化成把该行为下全部时段的
+       正样本合并，等价于旧版 positives_by_action。"""
+    if period is not None:
+        return s["positives_grouped"].get(f"{period}_{behavior}")
+    merged = []
+    for key, geo_sids in s["positives_grouped"].items():
+        if key.endswith(f"_{behavior}"):
+            merged.extend(g for g in geo_sids if g not in merged)
+    return merged or None
 
 
 def eval_behavior(model, tok, trie, samples: list, behavior: str, ec: dict,
@@ -238,6 +247,38 @@ def print_report(behavior: str, r: dict, ks: list, level_tags: list):
               f"吞吐 {r['n'] / max(r['infer_s'], 1e-9):.1f} 用户/s")
 
 
+def composite_report(reports: dict, behavior: str, periods: list) -> dict:
+    """同一 behavior 下所有 (period) 组直接按样本量加权平均（微平均，不是先各组
+       求平均再对组数取平均）：等价于把该 behavior 下全部组的评测实例池到一起
+       统一算，样本量大的组自然权重更大。pay/clk 分开算，不跨行为聚合。
+       以后加 geohash_rank 维度，这里的 groups 换成 (period, geohash_rank) 的
+       笛卡尔积即可，公式不用变。"""
+    groups = [reports[(behavior, p)] for p in periods if reports[(behavior, p)]["n"] > 0]
+    total_n = sum(g["n"] for g in groups)
+    if total_n == 0:
+        return {}
+    out = {"n": total_n}
+    for name in ("model", "pop"):
+        ks = list(groups[0][name].keys())
+        out[name] = {k: {m: sum(g[name][k][m] * g["n"] for g in groups) / total_n
+                         for m in ("hr", "recall", "ndcg")}
+                     for k in ks}
+    return out
+
+
+def print_composite(behavior: str, comp: dict, ks: list):
+    if not comp:
+        print(f"\n---- {behavior}（跨时段组微平均）：无有效分组，跳过 ----")
+        return
+    print(f"\n---- {behavior}（跨全部时段组微平均，共 {comp['n']} 条评测实例）----")
+    headers = ["模型"] + [f"{m}@{k}" for k in ks for m in ("HR", "Recall", "NDCG")]
+    rows = []
+    for name, tag in (("model", "GAMER"), ("pop", "热门基线")):
+        rows.append([tag] + [f"{comp[name][k][m]:.4f}"
+                             for k in ks for m in ("hr", "recall", "ndcg")])
+    print(_render_table(rows, headers))
+
+
 # ------------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------------
@@ -303,6 +344,13 @@ def main():
                      reports[(b, p)], ec["topk"], level_tags)
     print("\n（HR=top-K 命中任一正样本；Recall=命中数/正样本数；NDCG 按命中位置加权。"
           "热门基线 = test 用户 input 区该行为 item 频次 top-K，模型显著高于它才说明学到了个性化）")
+    print("==========================================")
+
+    print("\n============ 综合指标（分行为，跨时段组微平均） ============")
+    for b in tok.behaviors:
+        print_composite(b, composite_report(reports, b, periods), ec["topk"])
+    print("\n（同一行为下所有时段组的评测实例直接池到一起算，不是先各组求平均再对"
+          "组数取平均——样本量大的组权重自然更大。pay/clk 分开看，不跨行为聚合。）")
     print("==========================================")
 
 
