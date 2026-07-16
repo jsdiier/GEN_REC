@@ -62,7 +62,13 @@ class Qwen3NTPModel(nn.Module):
         else:
             hf_cfg = (HFQwen3Config(**hf_config_dict) if hf_config_dict is not None
                       else HFQwen3Config.from_pretrained(cfg.qwen3_path))
-            full = Qwen3ForCausalLM(hf_cfg, attn_implementation="sdpa")
+            # 直接构造（非 from_pretrained）时，attn_implementation 不是所有
+            # transformers 版本都支持当构造函数关键字传（远端环境版本较老，
+            # 报 TypeError: unexpected keyword argument 'attn_implementation'）；
+            # 写到 config 上是更早就支持、更兼容的方式，PreTrainedModel.__init__
+            # 会读 config._attn_implementation 决定用哪个注意力实现。
+            hf_cfg._attn_implementation = "sdpa"
+            full = Qwen3ForCausalLM(hf_cfg)
         full.resize_token_embeddings(cfg.vocab_size)   # 换成 SID 小词表，embedding+lm_head 同步 resize
         full.config.pad_token_id = cfg.pad_token_id
         full.config.use_cache = False
