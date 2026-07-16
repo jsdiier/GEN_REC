@@ -263,7 +263,12 @@ def save_checkpoint(path: str, model, cfg, model_type: str, epoch: int, val_loss
     """best.pt 只存权重（推理用，体积小）；last.pt 由调用方传 extra
        （optimizer/scheduler/global_step 等）支持断点续训。
        model_type 随 checkpoint 落盘，load_checkpoint 据此还原对应模型结构，
-       不依赖加载时 common.conf 恰好是哪个配置。"""
+       不依赖加载时 common.conf 恰好是哪个配置。
+       qwen3 额外存一份 hf_config（架构 dict，几个数字，不是权重）：eval/inference
+       重建架构骨架时直接从这份 dict 建，不用回头读 qwen3_path 的 config.json——
+       qwen3_path 是相对路径，训练（platform，NFS 挂载）和 eval/inference（本地
+       home 挂载）解析出来的绝对路径不是同一个物理位置，checkpoint 一旦跨语境
+       加载，按 qwen3_path 重新读文件就会读到不存在的路径。"""
     d = {
         "model": model.state_dict(),
         "config": asdict(cfg),
@@ -271,21 +276,31 @@ def save_checkpoint(path: str, model, cfg, model_type: str, epoch: int, val_loss
         "epoch": epoch,
         "val_loss": val_loss,
     }
+    if model_type == "qwen3":
+        d["hf_config"] = model.hf_config.to_dict()
     if extra:
         d.update(extra)
     torch.save(d, path)
 
 
-def load_checkpoint(path: str, map_location="cpu"):
-    """推理端还原：返回 (model, config, meta)。"""
+def load_checkpoint(path: str, map_location="cpu", qwen3_path: str = None):
+    """推理端还原：返回 (model, config, meta)。
+       qwen3_path：仅在 checkpoint 没存 hf_config（这个字段上线前存的旧 checkpoint）
+       时才用得上——传了就覆盖 checkpoint 里存的那份（训练时按平台 NFS 语境解析出
+       来的，换个语境大概率是错的路径），改用调用方当前环境自己解析出的路径。"""
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model_type = ckpt.get("model_type", "gamer")   # 旧 checkpoint 没有这个字段，默认 gamer
     cfg_d = dict(ckpt["config"])
     if model_type == "qwen3":
+        hf_config_dict = ckpt.get("hf_config")
+        if hf_config_dict is None and qwen3_path:
+            cfg_d["qwen3_path"] = qwen3_path
         cfg = Qwen3NTPConfig(**cfg_d)
-        # load_pretrained=False：只按 qwen3_path 的 config.json 建架构、随机初始化，
-        # 马上被下面的 load_state_dict 整体覆盖，加载真实预训练权重纯属浪费 I/O。
-        model = Qwen3NTPModel(cfg, load_pretrained=False)
+        # load_pretrained=False：只建架构、随机初始化，马上被下面的 load_state_dict
+        # 整体覆盖，加载真实预训练权重纯属浪费 I/O。hf_config 优先从 checkpoint 里
+        # 存的那份 dict 建架构（不碰 qwen3_path，跨语境也不会读错路径）；没有的话
+        # 才退回按 cfg.qwen3_path 读 config.json（此时才要求这个路径当前可达）。
+        model = Qwen3NTPModel(cfg, load_pretrained=False, hf_config_dict=hf_config_dict)
     else:
         cfg_d["behavior_levels"] = tuple(cfg_d["behavior_levels"])
         cfg = GAMERConfig(**cfg_d)

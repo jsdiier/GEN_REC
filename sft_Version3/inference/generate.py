@@ -100,6 +100,11 @@ def load_infer_config(conf_path: str) -> dict:
         "vocab_path": (lambda v: v if os.path.isabs(v) else os.path.join(root, v))(
             cp.get("train", "vocab_path", fallback="outputs/vocab.json")),
         "max_len": cp.getint("train", "max_len", fallback=512),
+        # qwen3 checkpoint 没存 hf_config 时的 fallback，同 eval/run_eval.py：
+        # 用当前这次运行自己的 common.conf 解析出的路径覆盖 checkpoint 里存的那份
+        "qwen3_path": (lambda v: "" if not v else
+                       (v if os.path.isabs(v) else os.path.join(root, v)))(
+            cp.get("train", "qwen3_path", fallback="").strip()),
         "favor_coord_field": cp.get("inference", "favor_coord_field",
                                     fallback="user_favor_coor_top3"),
         "favor_coord_topk": cp.getint("inference", "favor_coord_topk", fallback=3),
@@ -369,7 +374,8 @@ def main():
           f"radius={ic['favor_coord_radius_km']}km  topk坐标={ic['favor_coord_topk']}  "
           f"topk={ic['topk']}  beam={ic['beam_size']}  batch={ic['batch_size']}")
 
-    model, _cfg, meta = load_checkpoint(ic["ckpt_path"], map_location=device)
+    model, _cfg, meta = load_checkpoint(ic["ckpt_path"], map_location=device,
+                                        qwen3_path=ic["qwen3_path"] or None)
     model.to(device).eval()
     print(f"[INFO] ckpt={ic['ckpt_path']}  (epoch={meta['epoch']} "
           f"val_loss={meta['val_loss']:.4f})")

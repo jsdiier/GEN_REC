@@ -42,16 +42,26 @@ class Qwen3NTPConfig:
 
 
 class Qwen3NTPModel(nn.Module):
-    def __init__(self, cfg: Qwen3NTPConfig, load_pretrained: bool = True):
-        """load_pretrained=False：只按 qwen3_path 的 config.json 建架构、随机初始化，
-           跳过真实权重加载——load_checkpoint() 里马上会用 state_dict 整体覆盖，
-           真权重加载纯属浪费 I/O，仅 train_sft.py 主流程需要 True（真正吃预训练初始化）。"""
+    def __init__(self, cfg: Qwen3NTPConfig, load_pretrained: bool = True,
+                hf_config_dict: dict = None):
+        """load_pretrained=False：只建架构、随机初始化，跳过真实权重加载——
+           load_checkpoint() 里马上会用 state_dict 整体覆盖，加载真实预训练权重
+           纯属浪费 I/O，仅 train_sft.py 主流程需要 True（真正吃预训练初始化）。
+           hf_config_dict：架构 config 直接以 dict 传入（load_checkpoint 存在
+           checkpoint 里的那份），不用再读 qwen3_path 的 config.json——训练用的
+           qwen3_path 是相对路径，训练（platform，NFS 挂载）和 eval/inference
+           （本地 home 挂载）解析出来的绝对路径不是同一个物理位置，checkpoint
+           一旦跨语境加载就会读到不存在的路径；架构其实只是几个数字，直接存进
+           checkpoint 就能让 eval/inference 完全不依赖 qwen3_path 是否可达。
+           留空时退回旧路径（读 qwen3_path 的 config.json），只为兼容这个字段
+           上线前存的旧 checkpoint。"""
         super().__init__()
         self.cfg = cfg
         if load_pretrained:
             full = Qwen3ForCausalLM.from_pretrained(cfg.qwen3_path, attn_implementation="sdpa")
         else:
-            hf_cfg = HFQwen3Config.from_pretrained(cfg.qwen3_path)
+            hf_cfg = (HFQwen3Config(**hf_config_dict) if hf_config_dict is not None
+                      else HFQwen3Config.from_pretrained(cfg.qwen3_path))
             full = Qwen3ForCausalLM(hf_cfg, attn_implementation="sdpa")
         full.resize_token_embeddings(cfg.vocab_size)   # 换成 SID 小词表，embedding+lm_head 同步 resize
         full.config.pad_token_id = cfg.pad_token_id

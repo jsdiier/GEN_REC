@@ -77,7 +77,13 @@ def load_eval_config(conf_path: str) -> dict:
         return v if os.path.isabs(v) else os.path.join(root, v)
 
     topk = [int(k) for k in cp.get("eval", "topk", fallback="5,10,20").split(",")]
+    # qwen3 checkpoint 没存 hf_config 时的 fallback：用当前这次运行自己的
+    # common.conf 解析出的路径覆盖 checkpoint 里存的那份（训练是 platform/NFS
+    # 语境解析的，eval 这边跟训练不一定是同一个挂载点，checkpoint 里存的可能
+    # 是个当前环境读不到的路径）
+    qwen3_path_raw = cp.get("train", "qwen3_path", fallback="").strip()
     return {
+        "qwen3_path": "" if not qwen3_path_raw else path("train", "qwen3_path", qwen3_path_raw),
         "test_start": cp.get("data", "test_start"),
         "test_end": cp.get("data", "test_end"),
         "test_sample_rate": cp.getfloat("data", "test_sample_rate"),
@@ -300,7 +306,8 @@ def main():
           f"beam={ec['beam_size']}  batch={ec['batch_size']}")
 
     tok = SIDTokenizer.load(ec["vocab_path"])
-    model, cfg, meta = load_checkpoint(ec["ckpt_path"], map_location=device)
+    model, cfg, meta = load_checkpoint(ec["ckpt_path"], map_location=device,
+                                       qwen3_path=ec["qwen3_path"] or None)
     model.to(device).eval()
     print(f"[INFO] 模型加载完成: epoch={meta['epoch']}  val_loss={meta['val_loss']:.4f}  "
           f"参数量={model.num_parameters() / 1e6:.2f}M")
