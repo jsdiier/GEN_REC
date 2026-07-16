@@ -10,7 +10,7 @@ compare_eval.py
     python3 compare_eval.py <baseline_exp> <new_exp>   # 双实验：并列对比 + delta
 示例:
     python3 compare_eval.py sft_V3_tiger
-    python3 compare_eval.py sft_Version3 sft_V3_tiger
+    python3 compare_eval.py ntp_w_period_geo qwen_w_period_geo
     python3 compare_eval.py sft_Version3 sft_V3_tiger --topk 5,10,20
 
 说明:
@@ -125,6 +125,31 @@ def load_behavior(exp_dir: str, pred_dir: str, behavior: str, ks: list) -> dict:
     }
 
 
+def load_meta(exp_dir: str, pred_dir: str) -> dict:
+    """读 run_eval.py 落的 _meta.json（各组耗时/吞吐，pred_*.jsonl 里没有这个）。
+       返回 None 表示没有这个文件（旧版 run_eval.py 跑的实验，没落过这份）。"""
+    path = os.path.join(exp_dir, pred_dir, "_meta.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def behavior_qps(meta: dict, behavior: str) -> dict:
+    """把一个行为下全部时段组的耗时统计池到一起算总吞吐——跟精度指标的
+       "跨时段组微平均" 同一个口径：总用户数 / 总推理耗时，不是先各组算吞吐
+       再对组数取平均（组大小不一样，直接平均会失真）。"""
+    groups = [g for key, g in meta.get("groups", {}).items()
+             if key == behavior or key.startswith(f"{behavior}_")]
+    n = sum(g["n"] for g in groups)
+    infer_s = sum(g["infer_s"] for g in groups)
+    wall_s = sum(g["wall_s"] for g in groups)
+    if n == 0 or infer_s <= 0:
+        return None
+    return {"n": n, "infer_s": infer_s, "wall_s": wall_s,
+           "qps": n / infer_s, "ms_per_user": infer_s / n * 1000}
+
+
 def format_delta(delta: float) -> str:
     """千分位绝对提升，如 +2.092‰ / -1.500‰"""
     sign = "+" if delta >= 0 else ""
@@ -183,6 +208,31 @@ def print_behavior(behavior: str, ks: list, results: dict):
                    disable_numparse=True))
 
 
+def print_qps(behavior: str, results: dict):
+    """results: {exp_name: behavior_qps() 返回值}，1 个 = 展示，2 个 = 对比。
+       缺 _meta.json 的实验（旧版 run_eval.py 跑的）直接跳过，不参与这张表。"""
+    exps = [e for e in results if results[e] is not None]
+    if not exps:
+        return
+    pair = len(exps) == 2
+    cols = ([f"baseline\n{exps[0]}", f"new\n{exps[1]}", "倍数\nnew/baseline"]
+           if pair else [exps[0]])
+    rows = [
+        ["吞吐(用户/s)"] + [f"{results[e]['qps']:.2f}" for e in exps],
+        ["单用户耗时(ms)"] + [f"{results[e]['ms_per_user']:.1f}" for e in exps],
+        ["评测用户数"] + [str(results[e]["n"]) for e in exps],
+    ]
+    if pair:
+        base_qps, new_qps = results[exps[0]]["qps"], results[exps[1]]["qps"]
+        rows[0].append(f"{new_qps / base_qps:.2f}x")
+        base_ms, new_ms = results[exps[0]]["ms_per_user"], results[exps[1]]["ms_per_user"]
+        rows[1].append(f"{new_ms / base_ms:.2f}x")
+        rows[2].append("—")
+    print(tabulate(rows, headers=[f"{behavior.upper()} 推理速度"] + cols,
+                   tablefmt="fancy_grid", stralign="center",
+                   disable_numparse=True))
+
+
 def main():
     ap = argparse.ArgumentParser(description="对比各实验的 eval 预测明细指标")
     ap.add_argument("exps", nargs="+",
@@ -197,6 +247,7 @@ def main():
     root = os.path.dirname(os.path.abspath(__file__))
 
     results = {b: {} for b in BEHAVIORS}
+    qps_results = {b: {} for b in BEHAVIORS}
     for exp in args.exps:
         exp_dir = exp if os.path.isabs(exp) else os.path.join(root, exp)
         name = os.path.basename(exp_dir.rstrip("/"))
@@ -212,6 +263,14 @@ def main():
                       f"K={max(ks)} 按截断计算")
             results[b][name] = r
 
+        meta = load_meta(exp_dir, args.pred_dir)
+        if meta is None:
+            print(f"  ⚠  没有 _meta.json（旧版 run_eval.py 跑的实验没落过这份），"
+                  f"跳过 QPS 对比")
+        else:
+            for b in BEHAVIORS:
+                qps_results[b][name] = behavior_qps(meta, b)
+
     for b in BEHAVIORS:
         if results[b]:
             print_behavior(b, ks, results[b])
@@ -219,6 +278,12 @@ def main():
     if len(args.exps) == 2:
         print("\n[口径提醒] 两实验「精确命中」粒度不同时（4层=共享SID，5层=精确item），"
               "delta 只在同粒度层（如 L4）上公平；热门基线见各自 eval 日志。")
+
+    print("\n" + "=" * 60)
+    print("  推理速度对比（跨时段组池到一起算总吞吐，同精度指标口径）")
+    print("=" * 60)
+    for b in BEHAVIORS:
+        print_qps(b, qps_results[b])
 
 
 if __name__ == "__main__":

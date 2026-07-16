@@ -338,6 +338,20 @@ def main():
                                         period=p)
         print(f"[INFO] {tag} 预测明细已落盘: {pred_path}")
 
+    # 各组耗时/吞吐落一份 _meta.json：pred_*.jsonl 只存 uid/labels/topk，不含耗时，
+    # compare_eval.py 要对比 QPS 得从这份单独读（不然两实验的推理速度没法并排看）
+    meta_path = os.path.join(ec["predictions_out_dir"], "_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "ckpt_path": ec["ckpt_path"], "topk": ec["topk"],
+            "beam_size": ec["beam_size"], "batch_size": ec["batch_size"],
+            "groups": {(b if p is None else f"{b}_{p}"):
+                      {"n": r["n"], "infer_s": r["infer_s"],
+                       "wall_s": r["wall_s"], "n_batches": r["n_batches"]}
+                      for (b, p), r in reports.items()},
+        }, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] 耗时统计已落盘: {meta_path}")
+
     print("\n================ 评测报表 ================")
     for b, p in groups:
         print_report(b if p is None else f"{b} x {p}",
