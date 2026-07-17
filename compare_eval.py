@@ -203,7 +203,7 @@ def print_behavior(behavior: str, ks: list, results: dict):
                 row.append(format_delta((vals[1] - vals[0]) * 100)
                            if None not in vals else "—")
             rows2.append(row)
-    print(tabulate(rows2, headers=["前缀命中(方向诊断)"] + cols,
+    print(tabulate(rows2, headers=["前缀命中"] + cols,
                    tablefmt="fancy_grid", stralign="center",
                    disable_numparse=True))
 
@@ -218,9 +218,9 @@ def print_qps(behavior: str, results: dict):
     cols = ([f"baseline\n{exps[0]}", f"new\n{exps[1]}", "倍数\nnew/baseline"]
            if pair else [exps[0]])
     rows = [
-        ["吞吐(用户/s)"] + [f"{results[e]['qps']:.2f}" for e in exps],
-        ["单用户耗时(ms)"] + [f"{results[e]['ms_per_user']:.1f}" for e in exps],
-        ["评测用户数"] + [str(results[e]["n"]) for e in exps],
+        ["Throughput(user/s)"] + [f"{results[e]['qps']:.2f}" for e in exps],
+        ["Latency(ms/user)"] + [f"{results[e]['ms_per_user']:.1f}" for e in exps],
+        ["evaluated num"] + [str(results[e]["n"]) for e in exps],
     ]
     if pair:
         base_qps, new_qps = results[exps[0]]["qps"], results[exps[1]]["qps"]
@@ -228,7 +228,7 @@ def print_qps(behavior: str, results: dict):
         base_ms, new_ms = results[exps[0]]["ms_per_user"], results[exps[1]]["ms_per_user"]
         rows[1].append(f"{new_ms / base_ms:.2f}x")
         rows[2].append("—")
-    print(tabulate(rows, headers=[f"{behavior.upper()} 推理速度"] + cols,
+    print(tabulate(rows, headers=[f"{behavior.upper()} "] + cols,
                    tablefmt="fancy_grid", stralign="center",
                    disable_numparse=True))
 
