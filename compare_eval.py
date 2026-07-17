@@ -203,7 +203,7 @@ def print_behavior(behavior: str, ks: list, results: dict):
                 row.append(format_delta((vals[1] - vals[0]) * 100)
                            if None not in vals else "—")
             rows2.append(row)
-    print(tabulate(rows2, headers=["前缀命中"] + cols,
+    print(tabulate(rows2, headers=["Prefix hit"] + cols,
                    tablefmt="fancy_grid", stralign="center",
                    disable_numparse=True))
 
@@ -215,7 +215,7 @@ def print_qps(behavior: str, results: dict):
     if not exps:
         return
     pair = len(exps) == 2
-    cols = ([f"baseline\n{exps[0]}", f"new\n{exps[1]}", "倍数\nnew/baseline"]
+    cols = ([f"baseline\n{exps[0]}", f"new\n{exps[1]}", "Multiplier\nnew/baseline"]
            if pair else [exps[0]])
     rows = [
         ["Throughput(user/s)"] + [f"{results[e]['qps']:.2f}" for e in exps],
