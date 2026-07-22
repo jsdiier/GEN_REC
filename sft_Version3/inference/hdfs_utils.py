@@ -4,8 +4,7 @@
 hdfs_utils: 推理结果 HDFS 分区缓存的读取/合并工具，配合 generate.py 的
 「按 dt=YYYYMMDD 分区累积缓存，cache_key 粒度判重+按最新交互时间判过期」逻辑。
 
-设计（渐进式开发，本文件先只做「读」，「写」「判重」「与 generate.py 集成」
-留到后续步骤）：
+设计：
   - 每个 dt 分区下每个 behavior 只有一个文件 rec_{behavior}.parquet，
     永远是该 dt 的完整快照（每次推理整分区全量重写，不搞多文件累加）；
   - 找 <= 本次 infer_end 的最近一个已有 dt 分区，直接读它的内容做 baseline
@@ -31,11 +30,24 @@ import sys
 import configparser
 from collections import defaultdict
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.fs as pf
 
 _FS = None
 _DT_RE = re.compile(r"^dt=(\d{8})$")
+
+# cache_key/last_interact_ts 是整条缓存条目（一个 uid x geohash x period）
+# 共有的，其余五列是 topk 展开后逐 rank 的推荐负载
+SCHEMA = pa.schema([
+    ("cache_key", pa.string()),           # uid_<圆心geohash>_<version>_<period>
+    ("rank", pa.int32()),                 # 1 = 置信最高
+    ("score", pa.float32()),              # 各 SID token 的累计 logprob
+    ("sid", pa.string()),                 # 模型实际生成的 SID（其 geohash 未必等于圆心）
+    ("item_ids", pa.list_(pa.string())),  # sid 反查（一对多）
+    ("shop_id", pa.list_(pa.string())),   # 与 item_ids 逐一对应的店铺 id
+    ("last_interact_ts", pa.int64()),     # 生成时该用户全部历史最新一条交互的 ts
+])
 
 
 def get_fs() -> "pf.HadoopFileSystem":
@@ -89,13 +101,39 @@ def read_dt_cache(fs, hdfs_output_root: str, dt: str, behavior: str) -> dict:
     has_ts = "last_interact_ts" in table.column_names
     cols = table.column_names
     grouped = defaultdict(lambda: {"rows": [], "last_interact_ts": None})
+    row_cols = [c for c in cols if c not in ("cache_key", "last_interact_ts")]
     for row in table.to_pylist():
         ck = row["cache_key"]
-        grouped[ck]["rows"].append({k: row[k] for k in cols if k != "cache_key"})
+        grouped[ck]["rows"].append({k: row[k] for k in row_cols})
         if has_ts:
             # 同一 cache_key 各行的 last_interact_ts 理应一致，取任意一行即可
             grouped[ck]["last_interact_ts"] = row.get("last_interact_ts")
     return dict(grouped)
+
+
+def write_dt_cache(fs, hdfs_output_root: str, dt: str, behavior: str, merged: dict,
+                   buffer_rows: int = 50000) -> None:
+    """把合并后的完整缓存（baseline 中未变的条目 + 本次新增/刷新的条目）整体
+       重写到 dt 分区（该 behavior 的旧文件如果存在，直接覆盖）。merged 结构
+       同 read_dt_cache 的返回值：{cache_key: {"rows": [...], "last_interact_ts": ts}}。
+       流式攒 row group 写，不一次性把整表转成一个大 pa.Table（merged 本身已经
+       整个在内存里，这里只是控制单次 write_table 的行数，避免瞬时峰值内存翻倍）。"""
+    dt_dir = f"{hdfs_output_root}/dt={dt}"
+    path = f"{dt_dir}/rec_{behavior}.parquet"
+    fs.create_dir(dt_dir, recursive=True)
+    with fs.open_output_stream(path) as sink:
+        writer = pq.ParquetWriter(sink, SCHEMA)
+        buf = []
+        for cache_key, entry in merged.items():
+            ts = entry["last_interact_ts"]
+            for row in entry["rows"]:
+                buf.append({"cache_key": cache_key, "last_interact_ts": ts, **row})
+                if len(buf) >= buffer_rows:
+                    writer.write_table(pa.Table.from_pylist(buf, schema=SCHEMA))
+                    buf = []
+        if buf:
+            writer.write_table(pa.Table.from_pylist(buf, schema=SCHEMA))
+        writer.close()
 
 
 # ------------------------------------------------------------------

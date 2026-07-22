@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-generate: 批量推理（纯产出推荐结果，无 label、不算指标）——收藏坐标邻域约束缓存。
+generate: 批量推理（纯产出推荐结果，无 label、不算指标）——收藏坐标邻域约束缓存，
+按 dt=YYYYMMDD 分区累积在 HDFS 上，cache_key 粒度判重 + 按用户最新交互时间判过期。
 
 与 eval/run_eval 的区别：
   - 输入用【全部历史 S1..Sm】作前缀（真实推理场景，预测未来；eval 为留 label
     只用到 S(m-1)），有 >=1 个交互的用户即可推；
-  - 用户圈定：顺序取窗口内前 infer_max_num 个可推用户（产出结果不是评估，
-    不需要无偏抽样）；-1 = 全量；
   - 输出带 geo_sid -> item_id 反查（一对多：多个 item 可能共享同一 SID）。
 
 生成逻辑（线上缓存预热用）：不改前缀（仍只强制接 <时段><行为>），而是把 beam
@@ -16,30 +15,22 @@ search 第 0 层（geohash）的候选根限定为"该收藏坐标 radius_km 邻
 选，只是圈定了地理范围；每用户按 user_favor_coor_top3 字段解析出的收藏坐标
 （geohash 去重）与 periods 组合，各出一份缓存。
 每条推理的粒度 = uid x 收藏坐标圆心 geohash x period（缓存键 cache_key =
-uid_<圆心geohash>_<cache_version_tag>_<period>）。两个输出文件按行为分文件，
-以 cache_key 一一对应（jsonl 是 cache_key 粒度，parquet 是 cache_key x rank
-粒度）：
-  - rec_{行为}.parquet：仅 cache_key/rank/score/sid/item_ids/shop_id 六列
-    （精简为下游直接消费的推荐负载，period/坐标等上下文字段不落 parquet）；
-  - debug_{行为}.jsonl：uid/target_behavior/period/coord_rank/圆心geohash/
-    lng/lat/legal_geohashes(合法白名单)/cache_key + item_result（该 cache_key
-    下 top-K 涉及的全部真实 item：[{item_id, shop_id, geo_sid}, ...]）+
-    history(模型真实输入逐 token 拼接成的字符串，无分隔符，含开头 <bos> 与
-    结尾本次强制生成条件 <period><behavior>)/prompt_tokens。
-[inference] max_output_caches 只限制 debug_{行为}.jsonl 落盘前 N 个 cache_key
-（供人工抽样核对，不影响 beam search 计算/排序）；rec_{行为}.parquet 永远是
-本次推理的全部结果，不受这个开关影响。
+uid_<圆心geohash>_<cache_version_tag>_<period>）。
 
-流程：
-  1. 读 common.conf [inference]（窗口/上限/行为/topk/beam/ckpt/输出目录）
-     与 [train]（vocab_path/max_len）；
-  2. 加载 ckpt + item map 建 SID 前缀树与 sid->item_ids 反查表；
-  3. 流式拉窗口数据（复用 step1->2 + step3 的时间线/session 工具），逐用户拼
-     全历史前缀，按收藏坐标邻域限定 geohash 候选根后生成；
-  4. 边收边推边写（不整窗攒内存）：结果存 parquet（比 jsonl 省一个量级存储），
-     目录按推理窗口命名：{output_dir}/{infer_start}_{infer_end}/rec_{行为}.parquet，
-     行 = 一条推荐；同目录附 _meta.json（本次配置 + 统计），同窗口重跑会覆盖；
-  5. 结束打印纯推理 QPS、端到端 QPS（含取数/写盘）。
+HDFS 分区缓存（hdfs_utils.py）：
+  - rec_{行为}.parquet 落 [inference] hdfs_output_root 下 dt=infer_end/ 分区，
+    每个 dt 每个行为一个文件，是该 dt 的完整缓存快照（cache_key x rank，
+    含 cache_key/rank/score/sid/item_ids/shop_id/last_interact_ts 七列）；
+  - 每次推理先找 <= infer_end 的最近已有 dt 分区读入当 baseline；对每个
+    (uid, geohash, period) 算出 cache_key：baseline 没有 -> 新增；baseline
+    有但该用户全部历史最新交互时间变了（或 baseline 缺这个字段，判不出来）
+    -> 过期，都需要重新推理；否则 -> 命中，直接沿用 baseline 里的旧结果；
+  - 新增+过期两类累计数量达到 infer_max_num（或窗口用户耗尽）即停止推理；
+  - baseline（命中的 + 本次没扫描到的）+ 本次新推理结果，合并后整体重写到
+    dt=infer_end 分区（不是增量追加，是每次全量重写这一个分区的完整快照）。
+  - debug_{行为}.jsonl / _meta.json 仍落本地 output_dir（不上 HDFS）；
+    debug 只记录本次真正推理（新增/过期）过的 cache_key，命中跳过的没有
+    新的模型输入可看，故不写。
 
 用法:
     python generate.py [common.conf]
@@ -54,8 +45,6 @@ import contextlib
 from collections import defaultdict
 
 import torch
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for p in ("train", os.path.join("train", "model"), "data", "inference"):
@@ -66,6 +55,7 @@ from train_sft import load_checkpoint                      # noqa: E402
 from constrained_decode import (build_sid_trie, constrained_beam_search,  # noqa: E402
                                 make_prefix)
 import geo_utils as geo                                    # noqa: E402
+import hdfs_utils as hu                                     # noqa: E402
 
 
 # ------------------------------------------------------------------
@@ -116,18 +106,25 @@ def load_infer_config(conf_path: str) -> dict:
                                           fallback=True),
         "max_output_caches": cp.getint("inference", "max_output_caches",
                                        fallback=-1),
+        # rec_*.parquet 落 HDFS 的根目录，其下按 dt=YYYYMMDD 建分区（见 hdfs_utils.py）
+        "hdfs_output_root": cp.get("inference", "hdfs_output_root").rstrip("/"),
     }
 
 
 # ------------------------------------------------------------------
-# 数据：全历史用户流 + 收藏坐标原始字段
+# 数据：全历史用户流 + 收藏坐标原始字段 + 最新交互时间
 # ------------------------------------------------------------------
 def iter_infer_users_with_coords(conf_path: str, ic: dict, id2sid: dict):
-    """流式产出 (uid, items, favor_coord_raw)：items = 全部历史交互
-       [(action, geo_sid, meal_period)...] 按时间原序；favor_coord_raw = 原始行的
-       收藏坐标字段（lng@lat^lng@lat^... 格式）。复刻 step3.iter_user_samples
-       内部的取数链路（而非改造其共享签名），避免把本功能的耦合带进 train/eval
-       也在用的公共函数。顺序取前 infer_max_num 个可推用户（>=1 个交互）即停。"""
+    """流式产出 (uid, items, favor_coord_raw, last_interact_ts)：items = 全部
+       历史交互 [(action, geo_sid, meal_period)...] 按时间原序；favor_coord_raw
+       = 原始行的收藏坐标字段（lng@lat^lng@lat^... 格式）；last_interact_ts =
+       该用户全部历史里最新一条交互的 ts（timeline 已按 ts 升序，取最后一条），
+       用于跟 HDFS baseline 缓存里记录的时间比对、判断是否过期。复刻
+       step3.iter_user_samples 内部的取数链路（而非改造其共享签名），避免把
+       本功能的耦合带进 train/eval 也在用的公共函数。这里本身不做
+       infer_max_num 早停——那个上限现在限制的是"新增+过期"的 cache_key 数
+       （命中缓存的用户不消耗名额），必须扫过更多用户才能凑够，早停条件由
+       调用方 generate_for_users 按分类结果动态判断，不能按原始用户数停。"""
     import step3_build_samples as step3
     from step1_get_user_action import load_config, stream_rows
     from step2_inject_sid import map_sample
@@ -139,73 +136,26 @@ def iter_infer_users_with_coords(conf_path: str, ic: dict, id2sid: dict):
     tz_offset = cfg["tz_offset_hours"]
     field = ic["favor_coord_field"]
 
-    n = 0
     for _dt, _hdfs, _schema, row in stream_rows(cfg, verbose=True):
         mapped = map_sample(row, id2sid, seq_fields)
         timeline = step3.build_timeline(mapped, seq_fields, tz_offset)
+        if not timeline:
+            continue
+        last_interact_ts = timeline[-1]["ts"]
         sessions = step3.sessionize_by_day(timeline)
         items = [(t["action"], t["geo_sid"], t["meal_period"])
                  for _, toks in sessions for t in toks]
-        if not items:
-            continue
-        yield row.get("uid"), items, row.get(field)
-        n += 1
-        if 0 < ic["infer_max_num"] <= n:
-            break
+        yield row.get("uid"), items, row.get(field), last_interact_ts
 
 
 # ------------------------------------------------------------------
-# 输出：流式 parquet
+# 输出：本地调试 jsonl
 # ------------------------------------------------------------------
-class ParquetRecWriter:
-    """流式 parquet 写入：每条推荐一行，攒满 buffer_rows 写一个 row group，
-       不整窗攒内存。用完必须 close()。一个文件混装多个 cache_key（uid x 圆心
-       geohash x period）的推荐，只靠 cache_key 区分——period/coord_rank/圆心
-       geohash/白名单等上下文字段不落 parquet（要看这些去 debug_{行为}.jsonl，
-       同一 cache_key 在两个文件里一一对应）。"""
-    SCHEMA = pa.schema([
-        ("cache_key", pa.string()),           # uid_<圆心geohash>_<version>_<period>
-        ("rank", pa.int32()),                 # 1 = 置信最高
-        ("score", pa.float32()),              # 各 SID token 的累计 logprob
-        ("sid", pa.string()),                 # 模型实际生成的 SID（其 geohash 未必等于圆心）
-        ("item_ids", pa.list_(pa.string())),  # sid 反查（一对多）
-        ("shop_id", pa.list_(pa.string())),   # 与 item_ids 逐一对应的店铺 id
-    ])
-
-    def __init__(self, path: str, sid2items: dict, id2shop: dict, topk: int,
-                 buffer_rows: int = 50000):
-        self.sid2items = sid2items
-        self.id2shop = id2shop
-        self.topk = topk
-        self.buffer_rows = buffer_rows
-        self.writer = pq.ParquetWriter(path, self.SCHEMA)
-        self.buf = []
-
-    def write_user(self, cache_key: str, beams):
-        for rank, (sid, score) in enumerate(beams[:self.topk], start=1):
-            item_ids = [str(x) for x in self.sid2items.get(sid, [])]
-            self.buf.append({
-                "cache_key": cache_key, "rank": rank, "score": float(score),
-                "sid": sid, "item_ids": item_ids,
-                "shop_id": [self.id2shop.get(x) for x in item_ids],
-            })
-        if len(self.buf) >= self.buffer_rows:
-            self._flush()
-
-    def _flush(self):
-        if self.buf:
-            self.writer.write_table(pa.Table.from_pylist(self.buf, schema=self.SCHEMA))
-            self.buf = []
-
-    def close(self):
-        self._flush()
-        self.writer.close()
-
-
 class DebugJsonlWriter:
-    """调试用：把喂给模型的输入解码成人可读形式逐行写 jsonl，与 parquet 并存。
-       解码自实际编码后的 prefix（tok.decode），而非增广前的原始 items——
-       这样才能反映 make_prefix 截断后模型真正看到的历史（尾部悬空的
+    """调试用：把喂给模型的输入解码成人可读形式逐行写 jsonl。只记录本次真正
+       推理过的 cache_key（新增/过期两类）——命中跳过的没有新的模型输入可看，
+       不写。解码自实际编码后的 prefix（tok.decode），而非增广前的原始
+       items——这样才能反映 make_prefix 截断后模型真正看到的历史（尾部悬空的
        <时段><行为> 强制条件 token 因不完整会被 decode 自动跳过，另作字段列出）。"""
 
     def __init__(self, path: str):
@@ -230,7 +180,7 @@ def _decode_history(tok, prefix: dict) -> str:
 
 def _build_item_result(beams, topk: int, sid2items: dict, id2shop: dict) -> list:
     """该 cache_key 下 top-K 涉及的全部真实 item 清单（跨所有 rank 展平，
-       与 parquet 落盘的 rank 范围一致）：[{item_id, shop_id, geo_sid}, ...]。
+       与落盘的 rank 范围一致）：[{item_id, shop_id, geo_sid}, ...]。
        geo_sid = 该 item 所属 rank 的 sid（一个 sid 下的所有 item 共享同一 geo_sid）。"""
     out = []
     for sid, _score in beams[:topk]:
@@ -244,25 +194,40 @@ def _build_item_result(beams, topk: int, sid2items: dict, id2shop: dict) -> list
 # 推理主体（与数据源解耦，便于单测）
 # ------------------------------------------------------------------
 def generate_for_users(model, tok, trie, user_iter, ic: dict,
-                       device, autocast_ctx, writers: dict,
+                       device, autocast_ctx, baselines: dict,
                        sid2items: dict, id2shop: dict,
-                       debug_writers: dict = None) -> dict:
-    """收藏坐标邻域约束缓存：每用户按 (behavior x period x 收藏坐标去重后的
-       geohash) 生成一份 top-K，第一层 geohash 候选被限定在该坐标 radius_km 内、
-       且真实存在 item 的 geohash 集合中（不改前缀，只改 beam search 的候选根，
-       geohash 仍由模型选）。writers 以 behavior 为键（一行为一文件）；返回同
-       结构统计 {behavior: {"n": 覆盖次数, "infer_s": 纯推理秒, "skipped": 空邻域跳过数}}。
-       debug_writers（可选，同以 behavior 为键）：写入模型真实输入的 token 字符串 + 合法
-       geohash 白名单 + item_result（该 cache_key 下全部真实 item 明细），
-       供人工核对；ic["max_output_caches"]>0 时只对 debug_writers 落盘前 N 个
-       cache_key（writers/parquet 不受影响，永远是全部结果；beam search 本身
-       的计算/排序也不受影响，只是少写一份调试记录）。"""
+                       debug_writers: dict = None) -> tuple:
+    """收藏坐标邻域约束缓存 + baseline 判重/过期判断：每用户按 (behavior x
+       period x 收藏坐标去重后的 geohash) 算出 cache_key，与 baselines[behavior]
+       比对——不存在则"新增"，存在但 last_interact_ts 对不上（或 baseline 缺
+       这个字段）则"过期"，二者都要重新跑 beam search；存在且时间一致则
+       "命中"，直接沿用 baseline 里的旧结果，不重新推理。新增+过期累计达到
+       ic["infer_max_num"] 后该 behavior 停止再推理新用户（其它 behavior 未达
+       上限的继续，直到全部达到上限或用户流耗尽）。
+
+       返回 (merged, stats)：
+         merged[behavior] = {cache_key: {"rows": [...], "last_interact_ts": ts}}
+           起点是 baselines[behavior] 的浅拷贝，本次新增/过期的 cache_key 会
+           被覆盖/新增进去，其余（命中的 + 本次没扫描到的）原样保留——即为
+           本次要整体重写回 HDFS 该 dt 分区的完整快照。
+         stats[behavior] = {"n": 实际推理次数, "infer_s": 纯推理秒,
+           "skipped": 空邻域跳过数, "new_keys"/"stale_keys"/"hit_keys": 三个
+           cache_key 集合（用于分类计数 + 反解 uid 数）}。
+
+       debug_writers（可选，以 behavior 为键）：只对本次真正推理（新增/过期）
+       的 cache_key 写调试记录；ic["max_output_caches"]>0 时限制条数。"""
     precision = geo.geohash_precision_from_vocab(tok)
     real_geohashes = {tok.id2token[tid][1:-1] for tid in trie.keys()}
     periods = ic["periods_resolved"]
     max_caches = ic.get("max_output_caches", -1)
-    stats = {b: {"n": 0, "infer_s": 0.0, "skipped": 0} for b in ic["behaviors"]}
+    cap = ic["infer_max_num"]
+
+    merged = {b: dict(baselines.get(b, {})) for b in ic["behaviors"]}
+    stats = {b: {"n": 0, "infer_s": 0.0, "skipped": 0,
+                 "new_keys": set(), "stale_keys": set(), "hit_keys": set()}
+             for b in ic["behaviors"]}
     written = {b: 0 for b in ic["behaviors"]}
+    done_behaviors = set()
 
     def resolve_coords(raw):
         """收藏坐标原始字段 -> 去重后的 (rank, lng, lat, geohash, legal_list, root)
@@ -288,17 +253,34 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
 
     def flush(batch):
         for behavior in ic["behaviors"]:
+            if behavior in done_behaviors:
+                continue
+            base = baselines.get(behavior, {})
+            s = stats[behavior]
             for period in periods:
-                rows = []                     # (uid, prefix, root, extra_cols)
-                for uid, items, coords in batch:
-                    prefix = make_prefix(tok, items, behavior, ic["max_len"],
-                                         period=period)
+                rows = []                     # (uid, prefix, root, last_ts, extra_cols)
+                for uid, items, coords, last_ts in batch:
+                    to_infer = []
                     for rank, lng, lat, gh, legal_list, root in coords:
                         if root is None:
-                            stats[behavior]["skipped"] += 1
+                            s["skipped"] += 1
                             continue
                         cache_key = f"{uid}_{gh}_{ic['cache_version_tag']}_{period}"
-                        rows.append((uid, prefix, root, {
+                        base_entry = base.get(cache_key)
+                        if base_entry is None:
+                            s["new_keys"].add(cache_key)
+                        elif base_entry["last_interact_ts"] != last_ts:  # None 也算不等
+                            s["stale_keys"].add(cache_key)
+                        else:
+                            s["hit_keys"].add(cache_key)
+                            continue          # 命中：沿用 baseline，不进入本次推理
+                        to_infer.append((rank, lng, lat, gh, legal_list, root, cache_key))
+                    if not to_infer:
+                        continue
+                    prefix = make_prefix(tok, items, behavior, ic["max_len"],
+                                         period=period)
+                    for rank, lng, lat, gh, legal_list, root, cache_key in to_infer:
+                        rows.append((uid, prefix, root, last_ts, {
                             "period": period, "coord_rank": rank, "geohash": gh,
                             "lng": lng, "lat": lat, "legal_geohashes": legal_list,
                             "cache_key": cache_key}))
@@ -310,11 +292,22 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
                 results = constrained_beam_search(model, tok, trie, prefixes,
                                                   ic["beam_size"], device, autocast_ctx,
                                                   roots=roots)
-                stats[behavior]["infer_s"] += time.time() - t0
-                stats[behavior]["n"] += len(rows)
-                for (uid, prefix, root, extra), beams in zip(rows, results):
-                    writers[behavior].write_user(extra["cache_key"], beams)
-                    if debug_writers and (max_caches < 0 or written[behavior] < max_caches):
+                s["infer_s"] += time.time() - t0
+                s["n"] += len(rows)
+                for (uid, prefix, root, last_ts, extra), beams in zip(rows, results):
+                    cache_key = extra["cache_key"]
+                    out_rows = []
+                    for rk, (sid, score) in enumerate(beams[:ic["topk"]], start=1):
+                        item_ids = [str(x) for x in sid2items.get(sid, [])]
+                        out_rows.append({
+                            "rank": rk, "score": float(score), "sid": sid,
+                            "item_ids": item_ids,
+                            "shop_id": [id2shop.get(x) for x in item_ids],
+                        })
+                    merged[behavior][cache_key] = {"rows": out_rows,
+                                                   "last_interact_ts": last_ts}
+                    if debug_writers and behavior in debug_writers and \
+                       (max_caches < 0 or written[behavior] < max_caches):
                         written[behavior] += 1
                         debug_writers[behavior].write({
                             "uid": uid, "target_behavior": behavior, **extra,
@@ -323,22 +316,26 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
                             "history": _decode_history(tok, prefix),
                             "prompt_tokens": len(prefix["input_ids"]),
                         })
+            if 0 <= cap <= len(s["new_keys"]) + len(s["stale_keys"]):
+                done_behaviors.add(behavior)
 
     batch, done = [], 0
-    for uid, items, raw_coord in user_iter:
+    for uid, items, raw_coord, last_ts in user_iter:
+        if len(done_behaviors) == len(ic["behaviors"]):
+            break
         coords = resolve_coords(raw_coord)
         if not coords:                        # 没有任何可用收藏坐标，跳过该用户
             continue
-        batch.append((uid, items, coords))
+        batch.append((uid, items, coords, last_ts))
         if len(batch) == ic["batch_size"]:
             flush(batch)
             done += len(batch)
             batch = []
             if done % (ic["batch_size"] * 20) < ic["batch_size"]:
-                print(f"  已推理 {done} 用户")
+                print(f"  已扫描 {done} 用户")
     if batch:
         flush(batch)
-    return stats
+    return merged, stats
 
 
 # ------------------------------------------------------------------
@@ -353,9 +350,9 @@ def main():
         autocast_ctx = lambda: torch.autocast("cuda", dtype=torch.bfloat16)  # noqa: E731
     else:
         autocast_ctx = contextlib.nullcontext
-    max_desc = "全量窗口" if ic["infer_max_num"] == -1 else f"前 {ic['infer_max_num']} 个可推用户"
+    max_desc = "全量窗口" if ic["infer_max_num"] == -1 else f"最多 {ic['infer_max_num']} 条新增/过期缓存"
     print(f"[INFO] device={device}")
-    print(f"[INFO] 推理窗口: {ic['infer_start']} ~ {ic['infer_end']}  取 {max_desc}")
+    print(f"[INFO] 推理窗口: {ic['infer_start']} ~ {ic['infer_end']}  {max_desc}")
 
     tok = SIDTokenizer.load(ic["vocab_path"])
     for b in ic["behaviors"]:
@@ -389,44 +386,61 @@ def main():
     trie = build_sid_trie(tok, id2sid.values())
     print(f"[INFO] trie 覆盖 {len(sid2items)} 个 SID（{len(id2sid)} 个 item）")
 
+    fs = hu.get_fs()
+    src_dt = hu.find_source_dt(fs, ic["hdfs_output_root"], ic["infer_end"])
+    print(f"[INFO] hdfs_output_root={ic['hdfs_output_root']}  baseline dt={src_dt}")
+    baselines = {}
+    for b in ic["behaviors"]:
+        baselines[b] = hu.read_dt_cache(fs, ic["hdfs_output_root"], src_dt, b) if src_dt else {}
+        base_uids = {hu.parse_uid(ck) for ck in baselines[b]}
+        print(f"  [{b}] baseline: cache_key={len(baselines[b])}  uid={len(base_uids)}")
+
     run_dir = os.path.join(ic["output_dir"], f"{ic['infer_start']}_{ic['infer_end']}")
     os.makedirs(run_dir, exist_ok=True)
     t_start = time.time()
 
-    paths = {b: os.path.join(run_dir, f"rec_{b}.parquet") for b in ic["behaviors"]}
-    writers = {b: ParquetRecWriter(p, sid2items, id2shop, ic["topk"])
-              for b, p in paths.items()}
     debug_paths = {b: os.path.join(run_dir, f"debug_{b}.jsonl")
                   for b in ic["behaviors"]} if ic["write_debug_input"] else {}
     debug_writers = {b: DebugJsonlWriter(p) for b, p in debug_paths.items()}
     try:
-        stats = generate_for_users(
+        merged, stats = generate_for_users(
             model, tok, trie, iter_infer_users_with_coords(conf_path, ic, id2sid),
-            ic, device, autocast_ctx, writers, sid2items, id2shop,
+            ic, device, autocast_ctx, baselines, sid2items, id2shop,
             debug_writers=debug_writers or None)
     finally:
-        for w in writers.values():
-            w.close()
         for w in debug_writers.values():
             w.close()
     wall_s = time.time() - t_start
 
-    total_req = sum(s["n"] for s in stats.values())
-    total_inf = sum(s["infer_s"] for s in stats.values())
-    total_skip = sum(s["skipped"] for s in stats.values())
-    print("\n================ 推理完成 ================")
+    print("\n================ 推理完成，判重明细 ================")
+    total_n = total_inf = total_skip = 0
     for b in ic["behaviors"]:
         s = stats[b]
+        new_uids = {hu.parse_uid(ck) for ck in s["new_keys"]}
+        stale_uids = {hu.parse_uid(ck) for ck in s["stale_keys"]}
+        hit_uids = {hu.parse_uid(ck) for ck in s["hit_keys"]}
+        merged_uids = {hu.parse_uid(ck) for ck in merged[b]}
+        base_uids = {hu.parse_uid(ck) for ck in baselines[b]}
+        print(f"  [{b}]")
+        print(f"    推理前 baseline: cache_key={len(baselines[b])}  uid={len(base_uids)}")
+        print(f"    新增: cache_key={len(s['new_keys'])}  uid={len(new_uids)}  |  "
+              f"过期: cache_key={len(s['stale_keys'])}  uid={len(stale_uids)}  |  "
+              f"命中跳过: cache_key={len(s['hit_keys'])}  uid={len(hit_uids)}")
         if s["n"]:
-            print(f"  {b}: {s['n']} 次生成  纯推理 {s['infer_s']:.1f}s  "
-                  f"QPS {s['n'] / max(s['infer_s'], 1e-9):.1f}  "
-                  f"跳过(空邻域) {s['skipped']}")
-        print(f"  结果: {paths[b]}" +
-              (f"  调试输入: {debug_paths[b]}" if b in debug_paths else ""))
-    print(f"  合计: {total_req} 次生成  跳过 {total_skip}  纯推理 QPS "
-          f"{total_req / max(total_inf, 1e-9):.1f}  |  全流程 {wall_s:.1f}s"
-          f"（含取数/编码/写盘）端到端 QPS {total_req / max(wall_s, 1e-9):.1f}")
-    print("==========================================")
+            print(f"    实际推理 {s['n']} 次  纯推理 {s['infer_s']:.1f}s  "
+                  f"QPS {s['n'] / max(s['infer_s'], 1e-9):.1f}  跳过(空邻域) {s['skipped']}")
+        print(f"    推理后累计: cache_key={len(merged[b])}  uid={len(merged_uids)}")
+        total_n += s["n"]; total_inf += s["infer_s"]; total_skip += s["skipped"]
+    print(f"  合计: {total_n} 次生成  跳过 {total_skip}  纯推理 QPS "
+          f"{total_n / max(total_inf, 1e-9):.1f}  |  全流程 {wall_s:.1f}s"
+          f"（含取数/编码/写盘）端到端 QPS {total_n / max(wall_s, 1e-9):.1f}")
+    print("=====================================================")
+
+    print("[INFO] 写回 HDFS ...")
+    for b in ic["behaviors"]:
+        hu.write_dt_cache(fs, ic["hdfs_output_root"], ic["infer_end"], b, merged[b])
+        print(f"  [{b}] -> {ic['hdfs_output_root']}/dt={ic['infer_end']}/rec_{b}.parquet"
+              f"（{len(merged[b])} 个 cache_key）")
 
     meta = {
         "infer_start": ic["infer_start"], "infer_end": ic["infer_end"],
@@ -441,14 +455,24 @@ def main():
         "ckpt_epoch": meta["epoch"], "ckpt_val_loss": round(meta["val_loss"], 4),
         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "wall_s": round(wall_s, 1),
-        "stats": {b: {"n": s["n"], "infer_s": round(s["infer_s"], 1),
-                     "skipped": s["skipped"],
-                     "qps": round(s["n"] / max(s["infer_s"], 1e-9), 1)}
-                  for b, s in stats.items()},
+        "hdfs_output_root": ic["hdfs_output_root"],
+        "baseline_dt": src_dt, "target_dt": ic["infer_end"],
+        "stats": {b: {
+            "baseline_cache_key": len(baselines[b]),
+            "baseline_uid": len({hu.parse_uid(ck) for ck in baselines[b]}),
+            "new_cache_key": len(stats[b]["new_keys"]),
+            "stale_cache_key": len(stats[b]["stale_keys"]),
+            "hit_cache_key": len(stats[b]["hit_keys"]),
+            "merged_cache_key": len(merged[b]),
+            "merged_uid": len({hu.parse_uid(ck) for ck in merged[b]}),
+            "n_infer": stats[b]["n"], "infer_s": round(stats[b]["infer_s"], 1),
+            "skipped": stats[b]["skipped"],
+            "qps": round(stats[b]["n"] / max(stats[b]["infer_s"], 1e-9), 1),
+        } for b in ic["behaviors"]},
     }
     with open(os.path.join(run_dir, "_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"[INFO] 配置与统计: {run_dir}/_meta.json")
+    print(f"[INFO] 本地调试/统计: {run_dir}")
 
 
 if __name__ == "__main__":
