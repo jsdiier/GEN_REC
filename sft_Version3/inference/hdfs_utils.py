@@ -27,6 +27,7 @@ uid 数、是否含 last_interact_ts 列，供人工核对。
 import os
 import re
 import sys
+import subprocess
 import configparser
 from collections import defaultdict
 
@@ -50,10 +51,31 @@ SCHEMA = pa.schema([
 ])
 
 
+def _ensure_classpath() -> None:
+    """pyarrow 的 HadoopFileSystem 底层走 libhdfs，需要 CLASSPATH 里包含全部
+       hadoop jar 包才能建连接（否则报 getJNIEnv/HDFS connection failed）。
+       通过交互式 shell 手动 export 不可靠——本函数走 Luban 平台提交时容器环境
+       不会带着手动设的变量，所以改成代码里自动兜底：已设置则跳过（幂等），
+       没设置就跑一次 `hadoop classpath --glob` 补上。"""
+    if os.environ.get("CLASSPATH"):
+        return
+    hadoop_bin = os.environ.get("HADOOP_BIN")
+    if not hadoop_bin:
+        hadoop_home = os.environ.get("HADOOP_HOME", "/usr/local/hadoop-current")
+        hadoop_bin = os.path.join(hadoop_home, "bin", "hadoop")
+    ret = subprocess.run([hadoop_bin, "classpath", "--glob"],
+                        capture_output=True, text=True)
+    if ret.returncode != 0 or not ret.stdout.strip():
+        raise RuntimeError(f"自动设置 CLASSPATH 失败（hadoop_bin={hadoop_bin}）: "
+                          f"{ret.stderr.strip()}")
+    os.environ["CLASSPATH"] = ret.stdout.strip()
+
+
 def get_fs() -> "pf.HadoopFileSystem":
     """进程内单例，避免重复建连接。"""
     global _FS
     if _FS is None:
+        _ensure_classpath()
         _FS = pf.HadoopFileSystem("default")
     return _FS
 
