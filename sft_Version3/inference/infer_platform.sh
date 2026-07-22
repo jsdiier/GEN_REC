@@ -1,8 +1,8 @@
 #!/bin/bash
 # Luban 平台容器内实际执行的批量推理入口（由 submit_infer.py 提交）。
 # $1 = 平台容器内的 common.conf 路径（scriptParam 传入）。
-# $2 = 数据并行分片号（可选，[inference] infer_num>1 时 submit_infer.py 才会
-#      传，同一次推理会有 infer_num 个容器并发跑本脚本，各带不同的 $2）。
+# $2 = 数据并行分片号（可选，[inference] gpu_num>1 时 submit_infer.py 才会
+#      传，同一次推理会有 gpu_num 个容器并发跑本脚本，各带不同的 $2）。
 # 职责：起环境 -> 改写路径前缀生成平台版 conf -> 直接跑 generate.py
 #（不经 generate.sh 的 launch_mode 分发，避免平台任务反过来又提交自己造成递归）。
 
@@ -39,7 +39,7 @@ SHARD_INDEX="${2:-}"
 PROJ_DIR="$(cd "$(dirname "${CONF_FILE}")" && pwd)"
 cd "${PROJ_DIR}"
 
-# 数据并行时 infer_num 个容器会并发跑本脚本，共享同一块 NFS——改写后的 conf
+# 数据并行时 gpu_num 个容器会并发跑本脚本，共享同一块 NFS——改写后的 conf
 # 和日志文件名都要带上分片号后缀，否则并发写同一个文件会互相覆盖/产生竞态
 SUFFIX=""
 if [ -n "${SHARD_INDEX}" ]; then

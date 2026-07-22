@@ -32,8 +32,8 @@ HDFS 分区缓存（hdfs_utils.py）：
     debug 只记录本次真正推理（新增/过期）过的 cache_key，命中跳过的没有
     新的模型输入可看，故不写。
 
-数据并行（[inference] infer_num>1，由 submit_infer.py 编排提交，不是本文件
-自己触发）：待推理用户按 crc32(uid) % infer_num 分片，各 shard 独立进程/
+数据并行（[inference] gpu_num>1，由 submit_infer.py 编排提交，不是本文件
+自己触发）：待推理用户按 crc32(uid) % gpu_num 分片，各 shard 独立进程/
 独立 GPU 只处理自己那一份，infer_max_num 是每个 shard 各自的上限（不是全局
 总量）；每个 shard 写 rec_{行为}_part{shard_index:03d}.parquet（不再是单一
 的 rec_{行为}.parquet），baseline 由编排方提前一次性合并成 _baseline 快照，
@@ -86,11 +86,11 @@ def load_infer_config(conf_path: str) -> dict:
     return {
         "infer_start": cp.get("inference", "infer_start"),
         "infer_end": cp.get("inference", "infer_end"),
-        # infer_num>1（数据并行）时这是每个分片独立的上限，不是全局总量
+        # gpu_num>1（数据并行）时这是每个分片独立的上限，不是全局总量
         "infer_max_num": cp.getint("inference", "infer_max_num", fallback=-1),
-        # 数据并行分片数：>1 时按 uid 哈希拆成 infer_num 份，由
-        # submit_infer.py 提交 infer_num 个独立单 GPU 任务；=1 = 不分片
-        "infer_num": cp.getint("inference", "infer_num", fallback=1),
+        # 数据并行分片数：>1 时按 uid 哈希拆成 gpu_num 份，由
+        # submit_infer.py 提交 gpu_num 个独立单 GPU 任务；=1 = 不分片
+        "gpu_num": cp.getint("inference", "gpu_num", fallback=1),
         "behaviors": [b.strip() for b in
                       cp.get("inference", "behaviors", fallback="clk,pay").split(",")
                       if b.strip()],
@@ -359,10 +359,10 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
 def main():
     conf_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "common.conf")
     # 数据并行分片编号：submit_infer.py 提交每个分片任务时以第二个位置参数传入
-    # （0-based，< infer_num）；不传（本地单卡直接跑）则视为不分片，忽略 infer_num
+    # （0-based，< gpu_num）；不传（本地单卡直接跑）则视为不分片，忽略 gpu_num
     shard_index = int(sys.argv[2]) if len(sys.argv) > 2 else None
     ic = load_infer_config(conf_path)
-    infer_num = ic["infer_num"] if shard_index is not None else 1
+    gpu_num = ic["gpu_num"] if shard_index is not None else 1
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda" and torch.cuda.is_bf16_supported():
@@ -372,7 +372,7 @@ def main():
     max_desc = "全量窗口" if ic["infer_max_num"] == -1 else f"最多 {ic['infer_max_num']} 条新增/过期缓存"
     print(f"[INFO] device={device}")
     if shard_index is not None:
-        print(f"[INFO] 数据并行分片: shard_index={shard_index}/{infer_num}")
+        print(f"[INFO] 数据并行分片: shard_index={shard_index}/{gpu_num}")
     print(f"[INFO] 推理窗口: {ic['infer_start']} ~ {ic['infer_end']}  {max_desc}")
 
     tok = SIDTokenizer.load(ic["vocab_path"])
@@ -414,17 +414,18 @@ def main():
     if shard_index is not None:
         # 数据并行 worker：只读编排方（submit_infer.py）已经准备好的那一份
         # _baseline 快照（历史 dt/历史 part 文件已经在编排阶段合并好了，这里
-        # 不用也不该自己再去 find_source_dt/glob 旧文件），并按本 shard 负责
-        # 的 uid 子集筛一遍——这样后面 generate_for_users 里 merged[behavior]
-        # 从一开始就只包含本 shard 的数据，写回时不用再额外过滤
+        # 不用也不该自己再去 find_source_dt/glob 旧文件）。按本 shard 负责的
+        # uid 子集过滤是在 hdfs_utils 内部的 pyarrow 层面做的（先 filter 再转
+        # Python 对象），不会把整份快照都物化成 Python dict——全量历史大的
+        # 时候（百万用户级别）这个区别决定了会不会被内存撑爆
         src_dt = ic["infer_end"]  # 快照落在 target dt 下，编排阶段已按来源合并好
         for b in ic["behaviors"]:
-            full = hu.read_baseline_snapshot(fs, ic["hdfs_output_root"], ic["infer_end"], b)
-            baselines[b] = {ck: v for ck, v in full.items()
-                            if hu.shard_of_uid(hu.parse_uid(ck), infer_num) == shard_index}
+            baselines[b] = hu.read_baseline_snapshot(
+                fs, ic["hdfs_output_root"], ic["infer_end"], b,
+                shard_index=shard_index, gpu_num=gpu_num)
             base_uids = {hu.parse_uid(ck) for ck in baselines[b]}
             print(f"  [{b}] 本 shard baseline: cache_key={len(baselines[b])}  "
-                  f"uid={len(base_uids)}（快照总量 cache_key={len(full)}）")
+                  f"uid={len(base_uids)}")
     else:
         src_dt = hu.find_source_dt(fs, ic["hdfs_output_root"], ic["infer_end"])
         print(f"[INFO] baseline dt={src_dt}")
@@ -447,7 +448,7 @@ def main():
     users = iter_infer_users_with_coords(conf_path, ic, id2sid)
     if shard_index is not None:
         users = (rec for rec in users
-                if hu.shard_of_uid(rec[0], infer_num) == shard_index)
+                if hu.shard_of_uid(rec[0], gpu_num) == shard_index)
     try:
         merged, stats = generate_for_users(
             model, tok, trie, users,
@@ -485,7 +486,7 @@ def main():
     print("[INFO] 写回 HDFS ...")
     for b in ic["behaviors"]:
         hu.write_dt_cache(fs, ic["hdfs_output_root"], ic["infer_end"], b, merged[b],
-                          shard_index=shard_index, infer_num=infer_num)
+                          shard_index=shard_index, gpu_num=gpu_num)
         out_name = (f"rec_{b}_part{shard_index:03d}.parquet" if shard_index is not None
                    else f"rec_{b}.parquet")
         print(f"  [{b}] -> {ic['hdfs_output_root']}/dt={ic['infer_end']}/{out_name}"
@@ -506,7 +507,7 @@ def main():
         "wall_s": round(wall_s, 1),
         "hdfs_output_root": ic["hdfs_output_root"],
         "baseline_dt": src_dt, "target_dt": ic["infer_end"],
-        "infer_num": infer_num, "shard_index": shard_index,
+        "gpu_num": gpu_num, "shard_index": shard_index,
         "stats": {b: {
             "baseline_cache_key": len(baselines[b]),
             "baseline_uid": len({hu.parse_uid(ck) for ck in baselines[b]}),

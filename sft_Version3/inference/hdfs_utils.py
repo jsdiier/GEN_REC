@@ -5,19 +5,20 @@ hdfs_utils: 推理结果 HDFS 分区缓存的读取/合并工具，配合 genera
 「按 dt=YYYYMMDD 分区累积缓存，cache_key 粒度判重+按最新交互时间判过期」逻辑。
 
 设计：
-  - 不分片（单卡，infer_num=1）：每个 dt 分区下每个 behavior 一个文件
+  - 不分片（单卡，gpu_num=1）：每个 dt 分区下每个 behavior 一个文件
     rec_{behavior}.parquet，是该 dt 的完整快照（每次推理整分区全量重写）；
     找 <= 本次 infer_end 的最近一个已有 dt 分区，直接读它的内容做 baseline
     （不需要真的 `hadoop fs -cp` 复制文件，反正是全量重写，读进内存、
     写到新 dt 路径即可）；
-  - 数据并行（infer_num>1）：待推理用户按 crc32(uid) % infer_num 分片，
-    提交 infer_num 个独立单 GPU 任务并行跑，每个分片各写自己的
+  - 数据并行（gpu_num>1）：待推理用户按 crc32(uid) % gpu_num 分片，
+    提交 gpu_num 个独立单 GPU 任务并行跑，每个分片各写自己的
     rec_{behavior}_part{分片号}.parquet。提交前由编排方（submit_infer.py）
     调 consolidate_baseline 一次性把历史结果（不管是老的单文件还是之前
-    某次不同 infer_num 留下的 part 文件）合并成一份 rec_{behavior}_baseline
-    快照，各分片 worker 只读这一份快照（不自己 glob 历史文件），避免
-    infer_num 前后两次运行不一致时旧 part 文件残留造成同一 cache_key
-    重复出现在多个文件里；全部分片成功后编排方删掉快照文件；
+    某次不同 gpu_num 留下的 part 文件）合并成一份 rec_{behavior}_baseline
+    快照，各分片 worker 只读这一份快照的【自己那部分】（不自己 glob 历史
+    文件，也不会把全量快照整个物化成 Python 对象——见 read_baseline_snapshot
+    的说明），避免 gpu_num 前后两次运行不一致时旧 part 文件残留造成同一
+    cache_key 重复出现在多个文件里；全部分片成功后编排方删掉快照文件；
   - baseline 按 cache_key 分组：一个 cache_key 对应 topk 行（rank 1..K），
     外加 last_interact_ts（该 cache_key 对应用户，生成时的全部历史最新
     交互时间，用于下次判断是否过期）；
@@ -118,12 +119,12 @@ def parse_uid(cache_key: str) -> str:
     return cache_key.rsplit("_", 3)[0]
 
 
-def shard_of_uid(uid, infer_num: int) -> int:
+def shard_of_uid(uid, gpu_num: int) -> int:
     """uid 的数据并行分片归属：跟本仓库已有的 test_sample_rate 一样用
-       crc32(uid) 确定性哈希——同一个 uid 只要 infer_num 不变，永远分到
-       同一个 shard；infer_num 变了，分配会整体重新洗牌（见
+       crc32(uid) 确定性哈希——同一个 uid 只要 gpu_num 不变，永远分到
+       同一个 shard；gpu_num 变了，分配会整体重新洗牌（见
        consolidate_baseline 对这种情况的处理）。"""
-    return zlib.crc32(str(uid).encode("utf-8")) % infer_num
+    return zlib.crc32(str(uid).encode("utf-8")) % gpu_num
 
 
 def glob_rec_files(fs, hdfs_output_root: str, dt: str, behavior: str) -> list:
@@ -143,23 +144,37 @@ def glob_rec_files(fs, hdfs_output_root: str, dt: str, behavior: str) -> list:
     )
 
 
+def _table_to_grouped(table, grouped=None) -> dict:
+    """单个 pyarrow Table -> 按 cache_key 合并的 baseline 字典（可传入已有
+       grouped 累加，供多文件合并复用）。真正把行物化成 Python dict 的地方
+       只有这一处——调用方如果只需要一部分行，应该先在 pyarrow 层面
+       table.filter() 筛完再传进来，不要传整张表再指望这里帮你扔掉多余的。"""
+    if grouped is None:
+        grouped = defaultdict(lambda: {"rows": [], "last_interact_ts": None})
+    has_ts = "last_interact_ts" in table.column_names
+    row_cols = [c for c in table.column_names
+               if c not in ("cache_key", "last_interact_ts")]
+    for row in table.to_pylist():
+        ck = row["cache_key"]
+        grouped[ck]["rows"].append({k: row[k] for k in row_cols})
+        if has_ts:
+            grouped[ck]["last_interact_ts"] = row.get("last_interact_ts")
+    return grouped
+
+
 def read_cache_files(fs, paths: list) -> dict:
     """读若干个 parquet 文件，按 cache_key 合并成一个 baseline 字典
        {cache_key: {"rows": [...], "last_interact_ts": ts_or_None}}。
        文件里没有 last_interact_ts 列（旧版本产出）则该文件贡献的条目
-       last_interact_ts 记 None（调用方应视为"无法判断是否过期"强制刷新）。"""
+       last_interact_ts 记 None（调用方应视为"无法判断是否过期"强制刷新）。
+       会把全部行整个物化成 Python 对象——用于编排阶段一次性合并全量历史
+       （只发生一次，不随分片数放大）；分片 worker 请用 read_baseline_snapshot
+       （带按分片过滤，不会整份物化）。"""
     grouped = defaultdict(lambda: {"rows": [], "last_interact_ts": None})
     for path in paths:
         with fs.open_input_file(path) as f:
             table = pq.read_table(f)
-        has_ts = "last_interact_ts" in table.column_names
-        row_cols = [c for c in table.column_names
-                   if c not in ("cache_key", "last_interact_ts")]
-        for row in table.to_pylist():
-            ck = row["cache_key"]
-            grouped[ck]["rows"].append({k: row[k] for k in row_cols})
-            if has_ts:
-                grouped[ck]["last_interact_ts"] = row.get("last_interact_ts")
+        _table_to_grouped(table, grouped)
     return dict(grouped)
 
 
@@ -190,19 +205,19 @@ def read_dt_cache(fs, hdfs_output_root: str, dt: str, behavior: str) -> dict:
 
 
 def write_dt_cache(fs, hdfs_output_root: str, dt: str, behavior: str, merged: dict,
-                   shard_index: int = None, infer_num: int = 1,
+                   shard_index: int = None, gpu_num: int = 1,
                    buffer_rows: int = 50000) -> None:
-    """写本次的完整结果。infer_num<=1（不分片，单卡）时写 rec_{behavior}.parquet
-       （老命名，向后兼容）；infer_num>1 时写 rec_{behavior}_part{shard_index}.parquet
+    """写本次的完整结果。gpu_num<=1（不分片，单卡）时写 rec_{behavior}.parquet
+       （老命名，向后兼容）；gpu_num>1 时写 rec_{behavior}_part{shard_index}.parquet
        （数据并行分片命名，此时 shard_index 必填，merged 应该已经是只含本
        shard 负责的 uid 那部分）。"""
     dt_dir = f"{hdfs_output_root}/dt={dt}"
     fs.create_dir(dt_dir, recursive=True)
-    if infer_num <= 1:
+    if gpu_num <= 1:
         path = f"{dt_dir}/rec_{behavior}.parquet"
     else:
         if shard_index is None:
-            raise ValueError("infer_num>1 时必须提供 shard_index")
+            raise ValueError("gpu_num>1 时必须提供 shard_index")
         path = f"{dt_dir}/rec_{behavior}_part{shard_index:03d}.parquet"
     write_cache_file(fs, path, merged, buffer_rows=buffer_rows)
 
@@ -215,9 +230,9 @@ def consolidate_baseline(fs, hdfs_output_root: str, source_dt, target_dt: str,
                          behavior: str):
     """数据并行编排（submit_infer.py）专用，在提交任何分片任务之前调用一次：
        把 source_dt 分区下该 behavior 现存的全部结果文件（不管是老的单文件
-       还是之前某次不同 infer_num 分片留下的 part 文件）合并读出，写成
+       还是之前某次不同 gpu_num 分片留下的 part 文件）合并读出，写成
        target_dt 分区下统一的一份 _baseline 快照文件，供本次全部分片 worker
-       读取——避免两次运行 infer_num 不一致时，旧 part 文件残留导致同一个
+       读取——避免两次运行 gpu_num 不一致时，旧 part 文件残留导致同一个
        cache_key 重复出现在多个文件里。
 
        source_dt == target_dt（同一天重跑）时，被合并进快照的旧文件在快照
@@ -244,15 +259,29 @@ def consolidate_baseline(fs, hdfs_output_root: str, source_dt, target_dt: str,
     return snapshot_path
 
 
-def read_baseline_snapshot(fs, hdfs_output_root: str, dt: str, behavior: str) -> dict:
+def read_baseline_snapshot(fs, hdfs_output_root: str, dt: str, behavior: str,
+                           shard_index: int = None, gpu_num: int = 1) -> dict:
     """分片 worker 专用：只读 consolidate_baseline 已经准备好的那一份快照
        文件（不再自己 glob 旧结果文件——那些在编排阶段已经被合并/清理过了）。
+
+       传入 shard_index/gpu_num（gpu_num>1）时，会先在 pyarrow 层面按
+       crc32(uid)%gpu_num 筛出属于本分片的那些行（table.filter，纯列式
+       操作，不产生 Python 对象），再把这一小部分转成 Python dict——不会像
+       "整份读成 Python dict 再筛选"那样让每个分片都临时扛着全量数据的内存，
+       全量历史很大时（比如百万用户级别）这个区别很关键。
+
        快照不存在（没有任何历史，首次推理）则返回空字典。"""
     path = _baseline_snapshot_path(hdfs_output_root, dt, behavior)
     info = fs.get_file_info(path)
     if info.type == pf.FileType.NotFound:
         return {}
-    return read_cache_files(fs, [path])
+    with fs.open_input_file(path) as f:
+        table = pq.read_table(f)
+    if shard_index is not None and gpu_num > 1:
+        uids = (parse_uid(ck) for ck in table.column("cache_key").to_pylist())
+        mask = pa.array(shard_of_uid(u, gpu_num) == shard_index for u in uids)
+        table = table.filter(mask)
+    return dict(_table_to_grouped(table))
 
 
 def delete_baseline_snapshot(fs, hdfs_output_root: str, dt: str, behavior: str) -> None:
