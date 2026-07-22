@@ -257,6 +257,7 @@ def run_shard_worker(ic: dict, shard_index: int, model, tok, trie,
     max_caches = ic.get("max_output_caches", -1)
     rows_by_behavior = {}
     stats = {}
+    t_worker_start = time.time()
 
     for behavior in ic["behaviors"]:
         wl_path = ifc.work_list_path(rdir, behavior, shard_index)
@@ -288,6 +289,11 @@ def run_shard_worker(ic: dict, shard_index: int, model, tok, trie,
                                               roots=roots)
             s["infer_s"] += time.time() - t0
             s["n"] += len(batch)
+            if s["n"] % (bs * 20) < bs or i + bs >= len(items):
+                elapsed = time.time() - t_worker_start
+                qps = s["n"] / max(s["infer_s"], 1e-9)
+                print(f"  [{behavior}] 已推理 {s['n']}/{len(items)} 条  "
+                      f"QPS {qps:.2f}  已耗时 {elapsed:.0f}s")
             for it, prefix, beams in zip(batch, prefixes, results):
                 out_rows[it["cache_key"]] = {
                     "rows": _rows_from_beams(beams, ic["topk"], sid2items, id2shop),
