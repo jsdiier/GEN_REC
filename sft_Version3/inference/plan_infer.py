@@ -153,7 +153,35 @@ def run_planning(conf_path: str, ic: dict) -> dict:
         "src_dt": src_dt, "scan_s": scan_s, "n_scanned": n_scanned,
         "stats": stats, "cold_counts": {b: len(cold[b]) for b in behaviors},
         "work_counts": {b: [len(w) for w in work_lists[b]] for b in behaviors},
+        "baseline_cache_key": {b: len(baselines[b]) for b in behaviors},
+        "baseline_uid": {b: len({hu.parse_uid(ck) for ck in baselines[b]}) for b in behaviors},
     }
+
+
+def summarize_final(ic: dict, plan_result: dict) -> None:
+    """全部分片成功后调用：读 dt=infer_end 下这一轮真正落地的最终状态
+       （part_cold + 各分片各自写的 part{i}，glob 全部合并），打印"总的"
+       （跨全部分片，不是某一个分片自己的推理统计）推理前后 cache_key/uid
+       对比——这是 submit_infer.py 自己进程的输出，出现在你提交时那次
+       nohup/终端日志里，不在任何一个 infer_platform_*_part{i}.log 里
+       （那些只是各 GPU 自己的推理统计，看不到全局判重/合并结果）。"""
+    fs = hu.get_fs()
+    print("\n================ 数据并行本轮汇总 ================")
+    for b in ic["behaviors"]:
+        final = hu.read_dt_cache(fs, ic["hdfs_output_root"], ic["infer_end"], b)
+        final_uids = {hu.parse_uid(ck) for ck in final}
+        s = plan_result["stats"][b]
+        new_uids = {hu.parse_uid(ck) for ck in s["new_keys"]}
+        stale_uids = {hu.parse_uid(ck) for ck in s["stale_keys"]}
+        hit_uids = {hu.parse_uid(ck) for ck in s["hit_keys"]}
+        print(f"  [{b}]")
+        print(f"    推理前 baseline: cache_key={plan_result['baseline_cache_key'][b]}  "
+              f"uid={plan_result['baseline_uid'][b]}")
+        print(f"    新增: cache_key={len(s['new_keys'])}  uid={len(new_uids)}  |  "
+              f"过期: cache_key={len(s['stale_keys'])}  uid={len(stale_uids)}  |  "
+              f"命中: cache_key={len(s['hit_keys'])}  uid={len(hit_uids)}")
+        print(f"    推理后最终累计: cache_key={len(final)}  uid={len(final_uids)}")
+    print("====================================================")
 
 
 def main():

@@ -210,11 +210,12 @@ def _submit_sharded(pc: dict, conf_path: str, gpu_num: int, dry_run: bool) -> No
     print(f"[INFO] 项目: {pc['project_name']}  平台目录: {pc['platform_project_dir']}")
     print(f"[INFO] 数据并行 gpu_num={gpu_num}  target_dt={ic['infer_end']}")
 
+    plan_result = None
     if dry_run:
         print("[DRY-RUN] 跳过判重预处理（不真正提交/不改 HDFS/不建任务清单）")
     else:
         print("[INFO] 判重预处理开始（读历史缓存 + 流式扫描全量用户 + 分类）...")
-        plan_infer.run_planning(conf_path, ic)
+        plan_result = plan_infer.run_planning(conf_path, ic)
         print("[INFO] 判重预处理完成")
 
     jobs = []
@@ -243,6 +244,7 @@ def _submit_sharded(pc: dict, conf_path: str, gpu_num: int, dry_run: bool) -> No
         all_ok = all_ok and status == "SUCCEEDED"
 
     if all_ok:
+        plan_infer.summarize_final(ic, plan_result)
         rdir = ifc.run_dir(ic)
         for b in ic["behaviors"]:
             for i in range(gpu_num):
