@@ -1,6 +1,8 @@
 #!/bin/bash
 # Luban 平台容器内实际执行的批量推理入口（由 submit_infer.py 提交）。
 # $1 = 平台容器内的 common.conf 路径（scriptParam 传入）。
+# $2 = 数据并行分片号（可选，[inference] infer_num>1 时 submit_infer.py 才会
+#      传，同一次推理会有 infer_num 个容器并发跑本脚本，各带不同的 $2）。
 # 职责：起环境 -> 改写路径前缀生成平台版 conf -> 直接跑 generate.py
 #（不经 generate.sh 的 launch_mode 分发，避免平台任务反过来又提交自己造成递归）。
 
@@ -32,18 +34,32 @@ fi
 nvidia-smi || true
 # ============================================================================
 
-CONF_FILE="${1:?用法: infer_platform.sh <common.conf路径>}"
+CONF_FILE="${1:?用法: infer_platform.sh <common.conf路径> [shard_index]}"
+SHARD_INDEX="${2:-}"
 PROJ_DIR="$(cd "$(dirname "${CONF_FILE}")" && pwd)"
 cd "${PROJ_DIR}"
 
+# 数据并行时 infer_num 个容器会并发跑本脚本，共享同一块 NFS——改写后的 conf
+# 和日志文件名都要带上分片号后缀，否则并发写同一个文件会互相覆盖/产生竞态
+SUFFIX=""
+if [ -n "${SHARD_INDEX}" ]; then
+    SUFFIX="_part$(printf '%03d' "${SHARD_INDEX}")"
+fi
+
 # conf 里可能写着另一个挂载名的绝对路径，统一改写成本容器可见的前缀
 # （同 train_platform.sh / eval_platform.sh；qwen3_path 是相对路径不受影响）
-RUN_CONF="${PROJ_DIR}/common.platform.conf"
+RUN_CONF="${PROJ_DIR}/common.platform${SUFFIX}.conf"
 sed -e "s#/home/luban/rank-ssl#${DATA_PREFIX}#g" \
     -e "s#/nfs/dataset-ofs-rank-ssl#${DATA_PREFIX}#g" \
     "${CONF_FILE}" > "${RUN_CONF}"
 echo ">>> conf: ${CONF_FILE} -> ${RUN_CONF}（路径前缀已归一为 ${DATA_PREFIX}）"
 
 mkdir -p "${PROJ_DIR}/logs"
-python "${PROJ_DIR}/inference/generate.py" "${RUN_CONF}" \
-    2>&1 | tee "logs/infer_platform_$(date +%m%d_%H%M).log"
+if [ -n "${SHARD_INDEX}" ]; then
+    echo ">>> 数据并行分片: shard_index=${SHARD_INDEX}"
+    python "${PROJ_DIR}/inference/generate.py" "${RUN_CONF}" "${SHARD_INDEX}" \
+        2>&1 | tee "logs/infer_platform_$(date +%m%d_%H%M)${SUFFIX}.log"
+else
+    python "${PROJ_DIR}/inference/generate.py" "${RUN_CONF}" \
+        2>&1 | tee "logs/infer_platform_$(date +%m%d_%H%M).log"
+fi

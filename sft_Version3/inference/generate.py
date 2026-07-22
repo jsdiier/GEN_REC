@@ -32,8 +32,19 @@ HDFS 分区缓存（hdfs_utils.py）：
     debug 只记录本次真正推理（新增/过期）过的 cache_key，命中跳过的没有
     新的模型输入可看，故不写。
 
+数据并行（[inference] infer_num>1，由 submit_infer.py 编排提交，不是本文件
+自己触发）：待推理用户按 crc32(uid) % infer_num 分片，各 shard 独立进程/
+独立 GPU 只处理自己那一份，infer_max_num 是每个 shard 各自的上限（不是全局
+总量）；每个 shard 写 rec_{行为}_part{shard_index:03d}.parquet（不再是单一
+的 rec_{行为}.parquet），baseline 由编排方提前一次性合并成 _baseline 快照，
+本文件的 shard worker 只读这份快照，不自己找历史 dt/glob 旧文件；
+debug_{行为}.jsonl/_meta.json 文件名也带 _part{shard_index} 后缀，避免多个
+shard 并发写同一个 NFS 路径互相覆盖。
+
 用法:
-    python generate.py [common.conf]
+    python generate.py [common.conf]                  # 本地/单卡，不分片
+    python generate.py [common.conf] <shard_index>     # 数据并行 worker，
+                                                        # 由 submit_infer.py 调用
 """
 
 import os
@@ -75,7 +86,11 @@ def load_infer_config(conf_path: str) -> dict:
     return {
         "infer_start": cp.get("inference", "infer_start"),
         "infer_end": cp.get("inference", "infer_end"),
+        # infer_num>1（数据并行）时这是每个分片独立的上限，不是全局总量
         "infer_max_num": cp.getint("inference", "infer_max_num", fallback=-1),
+        # 数据并行分片数：>1 时按 uid 哈希拆成 infer_num 份，由
+        # submit_infer.py 提交 infer_num 个独立单 GPU 任务；=1 = 不分片
+        "infer_num": cp.getint("inference", "infer_num", fallback=1),
         "behaviors": [b.strip() for b in
                       cp.get("inference", "behaviors", fallback="clk,pay").split(",")
                       if b.strip()],
@@ -343,7 +358,11 @@ def generate_for_users(model, tok, trie, user_iter, ic: dict,
 # ------------------------------------------------------------------
 def main():
     conf_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "common.conf")
+    # 数据并行分片编号：submit_infer.py 提交每个分片任务时以第二个位置参数传入
+    # （0-based，< infer_num）；不传（本地单卡直接跑）则视为不分片，忽略 infer_num
+    shard_index = int(sys.argv[2]) if len(sys.argv) > 2 else None
     ic = load_infer_config(conf_path)
+    infer_num = ic["infer_num"] if shard_index is not None else 1
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda" and torch.cuda.is_bf16_supported():
@@ -352,6 +371,8 @@ def main():
         autocast_ctx = contextlib.nullcontext
     max_desc = "全量窗口" if ic["infer_max_num"] == -1 else f"最多 {ic['infer_max_num']} 条新增/过期缓存"
     print(f"[INFO] device={device}")
+    if shard_index is not None:
+        print(f"[INFO] 数据并行分片: shard_index={shard_index}/{infer_num}")
     print(f"[INFO] 推理窗口: {ic['infer_start']} ~ {ic['infer_end']}  {max_desc}")
 
     tok = SIDTokenizer.load(ic["vocab_path"])
@@ -387,24 +408,49 @@ def main():
     print(f"[INFO] trie 覆盖 {len(sid2items)} 个 SID（{len(id2sid)} 个 item）")
 
     fs = hu.get_fs()
-    src_dt = hu.find_source_dt(fs, ic["hdfs_output_root"], ic["infer_end"])
-    print(f"[INFO] hdfs_output_root={ic['hdfs_output_root']}  baseline dt={src_dt}")
+    print(f"[INFO] hdfs_output_root={ic['hdfs_output_root']}")
     baselines = {}
-    for b in ic["behaviors"]:
-        baselines[b] = hu.read_dt_cache(fs, ic["hdfs_output_root"], src_dt, b) if src_dt else {}
-        base_uids = {hu.parse_uid(ck) for ck in baselines[b]}
-        print(f"  [{b}] baseline: cache_key={len(baselines[b])}  uid={len(base_uids)}")
+    src_dt = None
+    if shard_index is not None:
+        # 数据并行 worker：只读编排方（submit_infer.py）已经准备好的那一份
+        # _baseline 快照（历史 dt/历史 part 文件已经在编排阶段合并好了，这里
+        # 不用也不该自己再去 find_source_dt/glob 旧文件），并按本 shard 负责
+        # 的 uid 子集筛一遍——这样后面 generate_for_users 里 merged[behavior]
+        # 从一开始就只包含本 shard 的数据，写回时不用再额外过滤
+        src_dt = ic["infer_end"]  # 快照落在 target dt 下，编排阶段已按来源合并好
+        for b in ic["behaviors"]:
+            full = hu.read_baseline_snapshot(fs, ic["hdfs_output_root"], ic["infer_end"], b)
+            baselines[b] = {ck: v for ck, v in full.items()
+                            if hu.shard_of_uid(hu.parse_uid(ck), infer_num) == shard_index}
+            base_uids = {hu.parse_uid(ck) for ck in baselines[b]}
+            print(f"  [{b}] 本 shard baseline: cache_key={len(baselines[b])}  "
+                  f"uid={len(base_uids)}（快照总量 cache_key={len(full)}）")
+    else:
+        src_dt = hu.find_source_dt(fs, ic["hdfs_output_root"], ic["infer_end"])
+        print(f"[INFO] baseline dt={src_dt}")
+        for b in ic["behaviors"]:
+            baselines[b] = hu.read_dt_cache(fs, ic["hdfs_output_root"], src_dt, b) if src_dt else {}
+            base_uids = {hu.parse_uid(ck) for ck in baselines[b]}
+            print(f"  [{b}] baseline: cache_key={len(baselines[b])}  uid={len(base_uids)}")
 
     run_dir = os.path.join(ic["output_dir"], f"{ic['infer_start']}_{ic['infer_end']}")
     os.makedirs(run_dir, exist_ok=True)
     t_start = time.time()
 
-    debug_paths = {b: os.path.join(run_dir, f"debug_{b}.jsonl")
+    # 数据并行时每个 shard 是独立进程/独立机器，但本地 output_dir 是共享 NFS
+    # 路径——debug jsonl/_meta.json 文件名必须带上 shard 后缀，否则多个 shard
+    # 并发写同一个文件会互相覆盖
+    suffix = f"_part{shard_index:03d}" if shard_index is not None else ""
+    debug_paths = {b: os.path.join(run_dir, f"debug_{b}{suffix}.jsonl")
                   for b in ic["behaviors"]} if ic["write_debug_input"] else {}
     debug_writers = {b: DebugJsonlWriter(p) for b, p in debug_paths.items()}
+    users = iter_infer_users_with_coords(conf_path, ic, id2sid)
+    if shard_index is not None:
+        users = (rec for rec in users
+                if hu.shard_of_uid(rec[0], infer_num) == shard_index)
     try:
         merged, stats = generate_for_users(
-            model, tok, trie, iter_infer_users_with_coords(conf_path, ic, id2sid),
+            model, tok, trie, users,
             ic, device, autocast_ctx, baselines, sid2items, id2shop,
             debug_writers=debug_writers or None)
     finally:
@@ -438,8 +484,11 @@ def main():
 
     print("[INFO] 写回 HDFS ...")
     for b in ic["behaviors"]:
-        hu.write_dt_cache(fs, ic["hdfs_output_root"], ic["infer_end"], b, merged[b])
-        print(f"  [{b}] -> {ic['hdfs_output_root']}/dt={ic['infer_end']}/rec_{b}.parquet"
+        hu.write_dt_cache(fs, ic["hdfs_output_root"], ic["infer_end"], b, merged[b],
+                          shard_index=shard_index, infer_num=infer_num)
+        out_name = (f"rec_{b}_part{shard_index:03d}.parquet" if shard_index is not None
+                   else f"rec_{b}.parquet")
+        print(f"  [{b}] -> {ic['hdfs_output_root']}/dt={ic['infer_end']}/{out_name}"
               f"（{len(merged[b])} 个 cache_key）")
 
     meta = {
@@ -457,6 +506,7 @@ def main():
         "wall_s": round(wall_s, 1),
         "hdfs_output_root": ic["hdfs_output_root"],
         "baseline_dt": src_dt, "target_dt": ic["infer_end"],
+        "infer_num": infer_num, "shard_index": shard_index,
         "stats": {b: {
             "baseline_cache_key": len(baselines[b]),
             "baseline_uid": len({hu.parse_uid(ck) for ck in baselines[b]}),
@@ -470,9 +520,10 @@ def main():
             "qps": round(stats[b]["n"] / max(stats[b]["infer_s"], 1e-9), 1),
         } for b in ic["behaviors"]},
     }
-    with open(os.path.join(run_dir, "_meta.json"), "w", encoding="utf-8") as f:
+    meta_name = f"_meta{suffix}.json" if shard_index is not None else "_meta.json"
+    with open(os.path.join(run_dir, meta_name), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"[INFO] 本地调试/统计: {run_dir}")
+    print(f"[INFO] 本地调试/统计: {run_dir}/{meta_name}")
 
 
 if __name__ == "__main__":
