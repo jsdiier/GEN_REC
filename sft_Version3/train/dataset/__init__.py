@@ -1,7 +1,10 @@
 from .sft_dataset import GAMERJsonlDataset, encode_train_record, encode_val_record
 from .collator import GAMERCollator
-from .stream_dataset import GAMERStreamingTrainDataset, collect_val_samples
+from .stream_dataset import (GAMERStreamingTrainDataset, collect_val_samples,
+                             collect_incremental_monitor_samples,
+                             count_incremental_samples)
 
 __all__ = ["GAMERJsonlDataset", "GAMERCollator",
            "GAMERStreamingTrainDataset", "collect_val_samples",
+           "collect_incremental_monitor_samples", "count_incremental_samples",
            "encode_train_record", "encode_val_record"]

@@ -26,7 +26,12 @@ train_sft: GAMER 从零训练循环（对齐论文 4.1.4 的训练配置）。
   - GAMERModel 仅 ~40M，单卡即可；qwen3 model_type 参数量取决于 qwen3_path 的权重
     （官方 Qwen3-0.6B 是 28 层）；CUDA 下自动用 bf16 autocast；
   - checkpoint 含 model state_dict + config 字段 + model_type + epoch/val_loss，
-    推理端用 load_checkpoint() 按 model_type 还原对应结构。
+    推理端用 load_checkpoint() 按 model_type 还原对应结构；
+  - [data] is_auto=1（增量训练，目前只支持 data_mode=stream）：只加载
+    output_dir/latest/best.pt 的权重（optimizer/epoch/lr 调度全新开始），
+    没有 val split（内部另抽一小撮当监控集选 best.pt，见
+    collect_incremental_monitor_samples）；训完才把 latest 改指向本次结果
+    （见 update_latest_and_prune），并按 max_ckpt_keep 轮换旧 checkpoint。
 
 用法:
     python train_sft.py [common.conf]
@@ -96,6 +101,16 @@ def load_train_config(conf_path: str) -> dict:
         "wandb_init_retries": cp.getint("train", "wandb_init_retries", fallback=3),
         "resume_from": (lambda v: "" if not v else path("resume_from", v))(
             cp.get("train", "resume_from", fallback="").strip()),
+        # [data] is_auto=1（增量训练）：只加载 output_dir/latest/best.pt 的权重
+        # 当初始化（optimizer/epoch 全新开始），训完按"最多保留 3 个 ckpt"轮换、
+        # 全部完成才把 latest 改指向新结果——跟 resume_from（同一个 run 目录里
+        # 接着上次没走完的 epoch/optimizer 状态续训）是两回事，不能同时配
+        "is_auto": cp.getint("data", "is_auto", fallback=0),
+        # 只用来给 checkpoint 目录命名加个数据覆盖日期前缀（见 run_stamp 拼接处），
+        # 不影响取数逻辑本身（取数窗口仍由 data/step1_get_user_action.load_config
+        # 自己读 [data] train_start/train_end）
+        "train_end": cp.get("data", "train_end", fallback=""),
+        "max_ckpt_keep": cp.getint("train", "max_ckpt_keep", fallback=3),
     }
 
 
@@ -313,6 +328,53 @@ def load_checkpoint(path: str, map_location="cpu", qwen3_path: str = None):
     return model, cfg, {"epoch": ckpt["epoch"], "val_loss": ckpt["val_loss"]}
 
 
+def update_latest_and_prune(output_dir: str, run_dir: str, run_stamp: str,
+                            max_keep: int) -> None:
+    """训练循环正常跑完之后才调用（不是训练开始时）：
+       1. 确认 run_dir 下确实有 best.pt（真的训出了可用于推理的权重）才动 latest，
+          没有就只告警、不改 latest——保留原来那个仍然可用的 checkpoint；
+       2. latest 软链原子性地改指向 run_stamp（先建临时软链再 os.replace 过去，
+          不是先删再建——"先删再建"中间会有一个 latest 完全不存在的窗口，
+          推理进程如果恰好在那个窗口读 latest/best.pt 会撞上瞬时
+          FileNotFoundError；os.replace 底层是 POSIX rename，全程 latest
+          要么是旧值要么已经是新值，不存在中间态）；
+       3. 轮换：output_dir 下所有含 best.pt 的子目录（不分是全量训练还是增量
+          训练产出的，一视同仁）按目录 mtime 排序，只留最新 max_keep 个，
+          其余整目录删除。没有 best.pt 的目录（比如某次训练崩了留下的半成品）
+          不参与排序和删除，原样留着，避免误删还没查清楚状况的东西。
+          （删除旧目录本身也是安全的：已经打开在读旧 checkpoint 的进程手上
+          持有的文件描述符不受目录项删除影响，读得到完整数据，这是
+          Linux/NFS 的标准语义，不需要额外处理。）"""
+    best_path = os.path.join(run_dir, "best.pt")
+    if not os.path.exists(best_path):
+        print(f"[WARN] {run_dir} 下没有 best.pt，不更新 latest（保留原有 checkpoint 可用）")
+        return
+
+    latest = os.path.join(output_dir, "latest")
+    if os.path.exists(latest) and not os.path.islink(latest):
+        print(f"[WARN] {latest} 已存在且不是软链（是个真目录），跳过更新")
+        return
+    tmp_link = f"{latest}.tmp{os.getpid()}"
+    if os.path.lexists(tmp_link):
+        os.remove(tmp_link)
+    os.symlink(run_stamp, tmp_link)
+    os.replace(tmp_link, latest)          # POSIX rename，原子替换，无中间态
+    print(f"[INFO] 训练完成，latest -> {run_stamp}")
+
+    import shutil
+    candidates = []
+    for name in os.listdir(output_dir):
+        p = os.path.join(output_dir, name)
+        if name == "latest" or not os.path.isdir(p) or os.path.islink(p):
+            continue
+        if os.path.exists(os.path.join(p, "best.pt")):
+            candidates.append((os.path.getmtime(p), name, p))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    for _mtime, name, p in candidates[max_keep:]:
+        shutil.rmtree(p)
+        print(f"[INFO] 超过保留上限 {max_keep} 个，已删除旧 checkpoint: {name}")
+
+
 # ------------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------------
@@ -336,19 +398,41 @@ def main():
     print(f"[INFO] vocab_size={tok.vocab_size}  num_levels={tok.num_levels}  "
           f"behaviors={tok.behaviors}")
     coll = GAMERCollator(pad_id=tok.pad_id)
+    if tc["is_auto"] and tc["data_mode"] != "stream":
+        raise ValueError("[data] is_auto=1（增量训练）目前只支持 [train] data_mode=stream")
+    if tc["is_auto"]:
+        # 训练正式开始前先完整流一遍窗口数据，数出这一轮增量实际覆盖多少
+        # 用户/多少条 train 序列——多花一次跟训练单个 epoch 同量级的扫描时间，
+        # 换来"开跑前就知道这轮增量有多大"，方便发现配置错误（比如窗口选空了）
+        from dataset import count_incremental_samples
+        print("[INFO] 增量训练：训练前先统计本轮样本数 ...")
+        count_incremental_samples(conf_path)
     if tc["data_mode"] == "stream":
-        # 流式：train 直连 HDFS（IterableDataset，worker 按 part 分片）；
-        # val 启动时抽样收集一次，常驻内存
-        from dataset import GAMERStreamingTrainDataset, collect_val_samples
-        train_ds = GAMERStreamingTrainDataset(conf_path, tok, max_len=tc["max_len"],
-                                              shuffle_buffer=tc["shuffle_buffer"],
-                                              seed=tc["seed"])
-        val_ds = GAMERJsonlDataset(None, tok, "val", max_len=tc["max_len"],
-                                   samples=collect_val_samples(
-                                       conf_path, tc["val_sample_rate"],
-                                       tc["max_val_users"]))
-        print(f"[INFO] data_mode=stream  val={len(val_ds)} 条（内存）  "
-              f"train 条数未知（流式）")
+        # 流式：train 直连 HDFS（IterableDataset，worker 按 part 分片）。
+        # is_auto=0：val 启动时抽样收集一次，常驻内存；
+        # is_auto=1（增量）：没有 val split，改用 collect_incremental_monitor_samples
+        # 从"本轮该训练的用户"里划一小撮只当监控集（不参与训练，train_ds 传
+        # 同样的 sample_rate 当 monitor_sample_rate 用于跳过这批 uid）
+        from dataset import (GAMERStreamingTrainDataset, collect_val_samples,
+                             collect_incremental_monitor_samples)
+        train_ds = GAMERStreamingTrainDataset(
+            conf_path, tok, max_len=tc["max_len"], shuffle_buffer=tc["shuffle_buffer"],
+            seed=tc["seed"],
+            monitor_sample_rate=tc["val_sample_rate"] if tc["is_auto"] else 0.0)
+        if tc["is_auto"]:
+            monitor_samples = collect_incremental_monitor_samples(
+                conf_path, tc["val_sample_rate"], tc["max_val_users"])
+            val_ds = GAMERJsonlDataset(None, tok, "train", max_len=tc["max_len"],
+                                       samples=monitor_samples)
+            print(f"[INFO] data_mode=stream  is_auto=1（增量）  "
+                  f"监控集={len(val_ds)} 条（内存，不参与训练）  train 条数未知（流式）")
+        else:
+            val_ds = GAMERJsonlDataset(None, tok, "val", max_len=tc["max_len"],
+                                       samples=collect_val_samples(
+                                           conf_path, tc["val_sample_rate"],
+                                           tc["max_val_users"]))
+            print(f"[INFO] data_mode=stream  val={len(val_ds)} 条（内存）  "
+                  f"train 条数未知（流式）")
         train_dl = DataLoader(train_ds, batch_size=tc["batch_size"],
                               collate_fn=coll, num_workers=tc["num_workers"],
                               pin_memory=(device == "cuda"))
@@ -387,6 +471,25 @@ def main():
     start_epoch, resume_dir = 1, None
     best_val, best_epoch, bad_epochs = float("inf"), -1, 0
     global_step = 0
+    if tc["is_auto"] and tc["resume_from"]:
+        raise ValueError("[data] is_auto=1（增量训练）与 [train] resume_from 不能同时配置："
+                         "增量训练总是基于 latest 的权重重新起一轮全新训练（optimizer/epoch"
+                         "全新开始），resume_from 是接着某次没训完的 run 继续，两者语义冲突")
+    if tc["is_auto"]:
+        base_ckpt = os.path.join(tc["output_dir"], "latest", "best.pt")
+        if not os.path.exists(base_ckpt):
+            raise FileNotFoundError(f"增量训练找不到基础权重: {base_ckpt}——"
+                                    f"outputs/ckpt/latest 得先指向一个含 best.pt 的完整 "
+                                    f"checkpoint 目录（全量训练产出的，或上一轮增量训练"
+                                    f"产出的）")
+        ck = torch.load(base_ckpt, map_location="cpu", weights_only=False)
+        ck_model_type = ck.get("model_type", "gamer")
+        if ck_model_type != tc["model_type"]:
+            raise ValueError(f"增量训练基础 checkpoint 的 model_type={ck_model_type} 与"
+                             f"当前 common.conf 的 model_type={tc['model_type']} 不一致")
+        model.load_state_dict(ck["model"])
+        print(f"[INFO] 增量训练：从 {base_ckpt} 加载权重（epoch={ck['epoch']} "
+              f"val_loss={ck['val_loss']:.4f}），optimizer/epoch/lr 调度全新开始")
     if tc["resume_from"]:
         ckpt_file = tc["resume_from"]
         if not ckpt_file.endswith(".pt"):
@@ -415,27 +518,28 @@ def main():
             print(f"[WARN] 已训满 epochs={tc['epochs']}，无事可做")
             return
 
-    # checkpoint 目录：全新训练建「启动时间」子目录，续训沿用原目录；
-    # latest 软链指向本次写入的目录，eval 默认读 latest/best.pt
+    # checkpoint 目录：全新训练建「启动时间」子目录，续训沿用原目录。
+    # 注意：latest 软链不在这里更新——训练途中 latest 必须继续指向上一个【已
+    # 训完、可用于推理】的 checkpoint，不能指向正在写的这个半成品目录（不然
+    # 推理/下一轮增量训练读 latest 会读到还没训完甚至崩溃后残缺的权重）。
+    # latest 的更新挪到 main() 末尾训练真正跑完之后，见 update_latest_and_prune。
     if resume_dir:
         run_dir = resume_dir
         run_stamp = os.path.basename(run_dir.rstrip("/"))
     else:
-        run_stamp = time.strftime("%Y%m%d_%H%M%S")
+        # {train_end}_{启动日期}_{启动时间}：train_end 是这次训练数据覆盖到
+        # 哪天，一眼就能看出这个 checkpoint 训的是哪个窗口的数据，不用再去
+        # 翻 common.conf 或猜测；train_end 留空（理论上不该发生，容错）则退回
+        # 纯时间戳
+        start_date, start_time = time.strftime("%Y%m%d"), time.strftime("%H%M%S")
+        run_stamp = (f"{tc['train_end']}_{start_date}_{start_time}" if tc["train_end"]
+                    else f"{start_date}_{start_time}")
         run_dir = os.path.join(tc["output_dir"], run_stamp)
         os.makedirs(run_dir, exist_ok=True)
-    if os.path.dirname(os.path.abspath(run_dir)) == os.path.abspath(tc["output_dir"]):
-        latest = os.path.join(tc["output_dir"], "latest")
-        if os.path.islink(latest):
-            os.remove(latest)
-        if not os.path.exists(latest):             # 同名真目录存在则不动，只告警
-            os.symlink(run_stamp, latest)
-        else:
-            print(f"[WARN] {latest} 已存在且不是软链，跳过更新")
     if not tc["wandb_run_name"]:                   # wandb run 名与目录共用时间戳，便于对应
         suffix = f"-r{start_epoch}" if resume_dir else ""
         tc["wandb_run_name"] = f"gamer-{tc['data_mode']}-{run_stamp}{suffix}"
-    print(f"[INFO] checkpoint 目录: {run_dir}  （latest -> {run_stamp}）")
+    print(f"[INFO] checkpoint 目录: {run_dir}  （训完才会把 latest 指过来）")
 
     slot_defs = build_slot_defs(tok, device)
     wb = init_wandb(tc, cfg)
@@ -541,6 +645,8 @@ def main():
         wb.finish()
     print(f"\n[DONE] best val_loss={best_val:.4f} @ epoch {best_epoch}  "
           f"checkpoint: {run_dir}/best.pt")
+
+    update_latest_and_prune(tc["output_dir"], run_dir, run_stamp, tc["max_ckpt_keep"])
 
 
 if __name__ == "__main__":

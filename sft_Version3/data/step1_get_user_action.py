@@ -92,6 +92,10 @@ def load_config(conf_path: str) -> dict:
         "train_label_scope": cp.get("data", "train_label_scope", fallback="slide"),
         "behavior_drop_x": cp.getint("data", "behavior_drop_x", fallback=3),
         "min_train_seq_len": cp.getint("data", "min_train_seq_len", fallback=2),
+        # 0（默认）= 现状：留一法三分 train/val/test（一次性全量训练）；
+        # 1 = 增量模式：只保留【最后一次交互时间落在 train_start~train_end】的用户，
+        #     用其全部历史 S1..Sm（不留一法切分）整条构造 train 序列，不出 val/test
+        "is_auto": cp.getint("data", "is_auto", fallback=0),
         "samples_out_dir": cp.get("data", "samples_out_dir", fallback=""),
         "seq_fields": [s.strip() for s in
                        cp.get("data", "seq_fields",

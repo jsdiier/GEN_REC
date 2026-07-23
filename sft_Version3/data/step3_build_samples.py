@@ -229,10 +229,36 @@ def build_all_samples(uid: str, sessions: list, behavior_drop_x: int,
     return out
 
 
+def build_incremental_samples(uid: str, sessions: list, behavior_drop_x: int,
+                              min_train_seq_len: int, train_start: str, train_end: str,
+                              favor_coord_raw=None) -> list:
+    """增量模式（[data] is_auto=1）：不做留一法三分，只看这一条——用户最后一次
+       交互的本地日期是否落在 [train_start, train_end] 窗口内：
+         - 不在窗口内：这一轮跳过该用户，返回 []（历史更早、这轮没有新动作的
+           用户不重复训练）；
+         - 在窗口内：用户全部历史 S1..Sm（不切分、不留 val/test）整条送去当
+           train 序列构造（复用 build_train_sequences，同样做 behavior-drop
+           增强），因为这个用户"有新东西"，让模型完整地重新学一遍它的序列。
+       train_start/train_end 是 YYYYMMDD 字符串，跟 sessions 里的本地日期
+       （YYYY-MM-DD）做字符串比较前先去掉连字符对齐格式。"""
+    if not sessions:
+        return []
+    last_date = sessions[-1][1][-1]["date"]          # 最后一个 session 最后一条交互的本地日期
+    if not last_date:
+        return []
+    last_dt8 = last_date.replace("-", "")             # "YYYY-MM-DD" -> "YYYYMMDD"
+    if not (train_start <= last_dt8 <= train_end):
+        return []
+    return build_train_sequences(uid, sessions, behavior_drop_x, min_train_seq_len)
+
+
 def iter_user_samples(cfg: dict, conf_path: str, part_filter=None,
                       id2sid: dict = None, verbose: bool = True):
     """流式产出 (uid, sessions, samples)：step1 取数 -> step2 映射 -> 按天切 session ->
-       build_all_samples。max_num 早停在此处理。
+       build_all_samples（[data] is_auto=0，默认，留一法三分 train/val/test）
+       或 build_incremental_samples（is_auto=1，增量：只挑最后一次交互落在
+       train_start~train_end 的用户，全部历史整条进 train，不出 val/test）。
+       max_num 早停在此处理。
        本文件 main()（诊断/落盘）与 train/dataset/stream_dataset（流式训练）共用这一份逻辑。
        part_filter 透传给 stream_rows 做多 worker 的 part 文件分片。"""
     if id2sid is None:
@@ -240,6 +266,7 @@ def iter_user_samples(cfg: dict, conf_path: str, part_filter=None,
     seq_fields = cfg["seq_fields"]
     tz_offset = cfg["tz_offset_hours"]
     favor_coord_field = cfg.get("favor_coord_field", "user_favor_coor_top3")
+    is_auto = cfg.get("is_auto", 0)
     unlimited = cfg["max_num"] == -1
     n = 0
     for _dt, _hdfs, _schema, row in stream_rows(cfg, part_filter=part_filter,
@@ -247,9 +274,16 @@ def iter_user_samples(cfg: dict, conf_path: str, part_filter=None,
         mapped = map_sample(row, id2sid, seq_fields)
         timeline = build_timeline(mapped, seq_fields, tz_offset)
         sessions = sessionize_by_day(timeline)
-        yield row.get("uid"), sessions, build_all_samples(
-            row.get("uid"), sessions, cfg["behavior_drop_x"], cfg["min_train_seq_len"],
-            row.get(favor_coord_field))
+        uid = row.get("uid")
+        if is_auto:
+            samples = build_incremental_samples(
+                uid, sessions, cfg["behavior_drop_x"], cfg["min_train_seq_len"],
+                cfg["train_start"], cfg["train_end"], row.get(favor_coord_field))
+        else:
+            samples = build_all_samples(
+                uid, sessions, cfg["behavior_drop_x"], cfg["min_train_seq_len"],
+                row.get(favor_coord_field))
+        yield uid, sessions, samples
         n += 1
         if not unlimited and n >= cfg["max_num"]:
             break
