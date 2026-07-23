@@ -422,6 +422,7 @@ def main():
     # 单卡（不分片）：判重 + 推理一体，逻辑不变
     src_dt = hu.find_source_dt(fs, ic["hdfs_output_root"], ic["infer_end"])
     print(f"[INFO] baseline dt={src_dt}")
+    hu.mark_doing(fs, ic["hdfs_output_root"], ic["infer_end"])
     baselines = {}
     for b in ic["behaviors"]:
         baselines[b] = hu.read_dt_cache(fs, ic["hdfs_output_root"], src_dt, b) if src_dt else {}
@@ -468,6 +469,8 @@ def main():
         hu.write_dt_cache(fs, ic["hdfs_output_root"], ic["infer_end"], b, merged[b])
         print(f"  [{b}] -> {ic['hdfs_output_root']}/dt={ic['infer_end']}/rec_{b}.parquet"
               f"（{len(merged[b])} 个 cache_key）")
+    hu.mark_done(fs, ic["hdfs_output_root"], ic["infer_end"])
+    print(f"[INFO] 已标记 dt={ic['infer_end']} 分区完成（.done）")
 
     meta = {
         "infer_start": ic["infer_start"], "infer_end": ic["infer_end"],

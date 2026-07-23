@@ -204,6 +204,7 @@ def _submit_single(pc: dict, dry_run: bool) -> None:
 def _submit_sharded(pc: dict, conf_path: str, gpu_num: int, dry_run: bool) -> None:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import infer_common as ifc
+    import hdfs_utils as hu
     import plan_infer
 
     ic = ifc.load_infer_config(conf_path)
@@ -214,6 +215,8 @@ def _submit_sharded(pc: dict, conf_path: str, gpu_num: int, dry_run: bool) -> No
     if dry_run:
         print("[DRY-RUN] 跳过判重预处理（不真正提交/不改 HDFS/不建任务清单）")
     else:
+        fs = hu.get_fs()
+        hu.mark_doing(fs, ic["hdfs_output_root"], ic["infer_end"])
         print("[INFO] 判重预处理开始（读历史缓存 + 流式扫描全量用户 + 分类）...")
         plan_result = plan_infer.run_planning(conf_path, ic)
         print("[INFO] 判重预处理完成")
@@ -244,6 +247,8 @@ def _submit_sharded(pc: dict, conf_path: str, gpu_num: int, dry_run: bool) -> No
         all_ok = all_ok and status == "SUCCEEDED"
 
     if all_ok:
+        hu.mark_done(fs, ic["hdfs_output_root"], ic["infer_end"])
+        print(f"[INFO] 已标记 dt={ic['infer_end']} 分区完成（.done）")
         plan_infer.summarize_final(ic, plan_result)
         rdir = ifc.run_dir(ic)
         for b in ic["behaviors"]:

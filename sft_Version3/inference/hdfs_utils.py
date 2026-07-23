@@ -36,6 +36,7 @@ uid 数、是否含 last_interact_ts 列，供人工核对。
 import os
 import re
 import sys
+import time
 import subprocess
 import configparser
 from collections import defaultdict
@@ -210,6 +211,31 @@ def write_dt_cache(fs, hdfs_output_root: str, dt: str, behavior: str, merged: di
             raise ValueError("gpu_num>1 时必须提供 shard_index")
         path = f"{dt_dir}/rec_{behavior}_part{shard_index:03d}.parquet"
     write_cache_file(fs, path, merged, buffer_rows=buffer_rows)
+
+
+def mark_doing(fs, hdfs_output_root: str, dt: str) -> None:
+    """开始写这个 dt 分区之前调用：写 .doing 标记（内容是开始时间，纯供人工
+       核对，程序不解析），顺手清掉可能残留的 .done（这个分区已经不再是
+       "完整可读"的状态了，直到 mark_done 之前都不该被下游/下一次判重当成
+       稳定分区来读）。"""
+    dt_dir = f"{hdfs_output_root}/dt={dt}"
+    fs.create_dir(dt_dir, recursive=True)
+    done_path = f"{dt_dir}/.done"
+    if fs.get_file_info(done_path).type != pf.FileType.NotFound:
+        fs.delete_file(done_path)
+    with fs.open_output_stream(f"{dt_dir}/.doing") as f:
+        f.write(f"started_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+
+
+def mark_done(fs, hdfs_output_root: str, dt: str) -> None:
+    """这个 dt 分区这一轮的全部写入（单卡：本次推理；数据并行：全部分片都
+       成功）确认完成后调用：写 .done、删掉 .doing。"""
+    dt_dir = f"{hdfs_output_root}/dt={dt}"
+    doing_path = f"{dt_dir}/.doing"
+    if fs.get_file_info(doing_path).type != pf.FileType.NotFound:
+        fs.delete_file(doing_path)
+    with fs.open_output_stream(f"{dt_dir}/.done") as f:
+        f.write(f"finished_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
 
 
 # ------------------------------------------------------------------
