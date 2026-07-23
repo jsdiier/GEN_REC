@@ -268,8 +268,21 @@ def iter_user_samples(cfg: dict, conf_path: str, part_filter=None,
     favor_coord_field = cfg.get("favor_coord_field", "user_favor_coor_top3")
     is_auto = cfg.get("is_auto", 0)
     unlimited = cfg["max_num"] == -1
+
+    # is_auto=1 时，取数只读 train_end 这一天的快照，不要按 stream_rows 原有
+    # 逻辑把 [train_start, train_end] 逐天全部读一遍——底层表每天都是"截至
+    # 当天的全量累积快照"，train_end 这天天然已经包含每个用户的完整历史
+    # （含他们最后一次交互是哪天），逐天重复读只会让同一个用户被扫到
+    # (train_end-train_start+1) 次、生成一模一样的训练序列，纯浪费。
+    # 过滤条件（判断"最后一次交互是否落在 train_start~train_end 区间"）
+    # 仍然用 cfg 里原本配置的完整区间，只是取数窗口收窄，语义不变。
+    stream_cfg = cfg
+    if is_auto:
+        stream_cfg = dict(cfg)
+        stream_cfg["train_start"] = cfg["train_end"]
+
     n = 0
-    for _dt, _hdfs, _schema, row in stream_rows(cfg, part_filter=part_filter,
+    for _dt, _hdfs, _schema, row in stream_rows(stream_cfg, part_filter=part_filter,
                                                 verbose=verbose):
         mapped = map_sample(row, id2sid, seq_fields)
         timeline = build_timeline(mapped, seq_fields, tz_offset)
